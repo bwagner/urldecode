@@ -12,7 +12,7 @@ t = s[i:]
 print("unredirected:")
 print(t)
 print()
-i = t.index('&');
+i = t.index('?');
 u = t[0:i]
 print("unparameterized:")
 print(u)
