@@ -1,19 +1,33 @@
 #!/usr/bin/env python
 import sys
 import re
+import xerox
 import urllib.parse as ul
-print()
-s = ul.unquote_plus(sys.argv[1])
-print("escaped:")
-print(s)
-print()
-i = re.search("https?", s[1:]).start() + 1
-t = s[i:]
-print("unredirected:")
-print(t)
-print()
-i = t.index('?');
-u = t[0:i]
-print("unparameterized:")
-print(u)
-print()
+
+def urlescape(url):
+    return ul.unquote_plus(url)
+
+def unredirect(url):
+    return url[re.search("https?", url[1:]).start() + 1:]
+
+def unparametrize(url):
+    return url[:url.index('?')] if "?" in url else url
+
+def main():
+    if len(sys.argv) == 1:
+        o = xerox.paste()
+        frm = "clipboard"
+    else:
+        o = sys.argv[1]
+        frm = "command line"
+    print(f"original from {frm}:\n{o}\n")
+    s = urlescape(o)
+    print(f"escaped:\n{s}\n")
+    t = unredirect(s)
+    print(f"unredirected:\n{t}\n")
+    p = unparametrize(t)
+    print(f"unparametrized (is now in clipbord):\n{p}\n")
+    xerox.copy(p)
+
+if __name__ == "__main__":
+    main()
