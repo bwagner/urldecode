@@ -1,21 +1,26 @@
 #!/usr/bin/env python
-import sys
 import re
-import xerox
+import sys
 import urllib.parse as ul
+
+import pyperclip
+
 
 def urlescape(url):
     return ul.unquote_plus(url)
 
+
 def unredirect(url):
-    return url[re.search("https?", url[1:]).start() + 1:]
+    return url[re.search("https?", url[1:]).start() + 1 :]
+
 
 def unparametrize(url):
-    return url[:url.index('?')] if "?" in url else url
+    return url[: url.index("?")] if "?" in url else url
+
 
 def main():
     if len(sys.argv) == 1:
-        o = xerox.paste()
+        o = pyperclip.paste()
         frm = "clipboard"
     else:
         o = sys.argv[1]
@@ -27,7 +32,8 @@ def main():
     print(f"unredirected:\n{t}\n")
     p = unparametrize(t)
     print(f"unparametrized (is now in clipbord):\n{p}\n")
-    xerox.copy(p)
+    pyperclip.copy(p)
+
 
 if __name__ == "__main__":
     main()
