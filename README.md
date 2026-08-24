@@ -33,17 +33,19 @@ Requires `uv`. The first run installs `pyperclip` into uv's cache.
 ## Usage
 
 ```
-usage: urldecode.py [-h] [-f] [-n] [-q] [url]
+usage: urldecode.py [-h] [-f] [-t] [-n] [-q] [url]
 
 positional arguments:
-  url            URL to unwrap (default: read the clipboard)
+  url                   URL to unwrap (default: read the clipboard)
 
 options:
-  -h, --help     show this help message and exit
-  -f, --follow   resolve shortener redirects over the network, through tor
-                 (see below)
-  -n, --no-copy  do not copy the result to the clipboard
-  -q, --quiet    print only the resulting URL
+  -h, --help            show this help message and exit
+  -f, --follow          resolve shortener redirects over the network, through
+                        tor (see below)
+  -t, --trust-inferred  with --follow, take a page's inferred forward (the ??
+                        line) as the result
+  -n, --no-copy         do not copy the result to the clipboard
+  -q, --quiet           print only the resulting URL
 
 --follow needs tor and never falls back to a direct connection:
 
@@ -187,10 +189,30 @@ not followed:
 ```
 
 The result on stdout and the clipboard stays the URL that actually settled;
-copy the `??` line yourself if it looks right. Following it automatically would
+copy the `??` line yourself if it looks right. Taking it automatically would
 make a wrong guess indistinguishable from a fact, and unlike stopping early,
 that failure would be silent - the output shape is identical whether the guess
 was right or wrong.
+
+Which is why it is available, but only by asking. `-t/--trust-inferred` makes
+the candidate the result, under a label that says where it came from:
+
+```console
+$ urldecode.py --follow --trust-inferred
+  .. 200 text/html, no redirect
+  ?? forwards to https://www.example.com/some-article
+     The headline the page says it is about to show you
+inferred:
+https://www.example.com/some-article
+(copied to clipboard)
+```
+
+`inferred:` in place of `unwrapped:` is the whole difference: one glance says
+whether the URL you just copied was read out of a wrapper and confirmed by a
+server, or read off a page's shape. The candidate is still never requested -
+`--trust-inferred` changes what is reported as the answer, not what goes over
+the wire - and the flag does nothing without `--follow`, which is what reads
+pages in the first place.
 
 **Neither, or several links with no way to choose.** The page is reported as the
 destination, which is an answer rather than the absence of one:

@@ -221,6 +221,11 @@ DECODE_ERRORS = "replace"
 FORWARD_MARKER = "  ?? forwards to"
 TITLE_INDENT = "     "
 DESTINATION_MESSAGE = "  .. no forward in the page: this is the destination"
+# The two kinds of answer this tool can end on: one read out of a wrapper or
+# confirmed by a server, one read off a page's shape. They print differently so
+# that a glance at the trace says which one reached stdout and the clipboard.
+UNWRAPPED_LABEL = "unwrapped:"
+INFERRED_LABEL = "inferred:"
 
 
 class Forward(NamedTuple):
@@ -364,14 +369,16 @@ def bounded_text(chunks, limit=MAX_BODY_BYTES):
     return read.decode(BODY_ENCODING, errors=DECODE_ERRORS)
 
 
-def _forwarding_hop(html, url, report):
+def _forwarding_hop(html, url, report, note=None):
     """Return the hop a page declares, or report what it shows and settle.
 
     A <meta refresh> is the page stating its destination, so it is returned
     silently and follow() prints it exactly as it prints a Location. A sole
     off-site anchor is this tool reading the markup rather than the page saying
-    so, and is only ever shown: followed, a wrong guess would be indistinguish-
-    able from a fact, and nothing downstream could tell the difference.
+    so, and is never returned as a hop: followed, a wrong guess would be
+    indistinguishable from a fact, and nothing downstream could tell the
+    difference. It is shown, and handed to `note` for a caller that asked to be
+    given candidates - which decides what to do with it, four levels up.
     """
     forward = forwarding_target(html, url)
     if forward is None:
@@ -379,9 +386,12 @@ def _forwarding_hop(html, url, report):
         return None
     if forward.declared:
         return forward.url
-    report(f"{FORWARD_MARKER} {unwrap(forward.url)}")
+    candidate = unwrap(forward.url)
+    report(f"{FORWARD_MARKER} {candidate}")
     if forward.title:
         report(f"{TITLE_INDENT}{forward.title}")
+    if note is not None:
+        note(candidate)
     return None
 
 
@@ -443,14 +453,14 @@ def _hop(response, report):
     return location
 
 
-def _read_forward(client, url, report):
+def _read_forward(client, url, report, note=None):
     """Open a capped prefix of a page and see whether it forwards on."""
     with client.stream("GET", url) as streamed:
         html = bounded_text(streamed.iter_bytes())
-    return _forwarding_hop(html, url, report)
+    return _forwarding_hop(html, url, report, note)
 
 
-def tor_resolver(socks_port, report):
+def tor_resolver(socks_port, report, note=None):
     """Return a resolve(url) that reads one hop through tor.
 
     Headers alone answer the question for a redirect. A page that settles is
@@ -477,11 +487,11 @@ def tor_resolver(socks_port, report):
                     return location
                 if not worth_reading(streamed):
                     return None
-                return _forwarding_hop(bounded_text(streamed.iter_bytes()), url, report)
+                return _forwarding_hop(bounded_text(streamed.iter_bytes()), url, report, note)
         location = _hop(response, report)
         if location is not None:
             return location
-        return _read_forward(client, url, report) if worth_reading(response) else None
+        return _read_forward(client, url, report, note) if worth_reading(response) else None
 
     return resolve
 
@@ -558,12 +568,12 @@ def tor_socks_port(report):
     return TOR_LAUNCH_PORT, start_tor(report)
 
 
-def resolve_through_tor(url, report):
+def resolve_through_tor(url, report, note=None):
     """Follow url to its destination over tor, cleaning it at every hop."""
     port, started = tor_socks_port(report)
     try:
         confirm_tor(port, started is not None, report)
-        resolve = tor_resolver(port, report)
+        resolve = tor_resolver(port, report, note)
 
         def reporting_resolve(target):
             location = resolve(target)
@@ -582,6 +592,18 @@ def resolve_through_tor(url, report):
             started.kill()
 
 
+def chosen_result(settled, inferred, trust):
+    """Return the URL to print, and the label that says what kind it is.
+
+    A candidate is only ever an inference from a page's shape, so it becomes the
+    answer on request and never by default. Asking for it does nothing when
+    there is none to give.
+    """
+    if trust and inferred is not None:
+        return inferred, INFERRED_LABEL
+    return settled, UNWRAPPED_LABEL
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -594,6 +616,12 @@ def main(argv=None):
         "--follow",
         action="store_true",
         help="resolve shortener redirects over the network, through tor (see below)",
+    )
+    parser.add_argument(
+        "-t",
+        "--trust-inferred",
+        action="store_true",
+        help="with --follow, take a page's inferred forward (the ?? line) as the result",
     )
     parser.add_argument("-n", "--no-copy", action="store_true", help="do not copy the result to the clipboard")
     parser.add_argument("-q", "--quiet", action="store_true", help="print only the resulting URL")
@@ -617,16 +645,24 @@ def main(argv=None):
     if target != url:
         report(f"  -> {target}")
 
+    inferred = None
+
+    def note(candidate):
+        """Remember a forward this tool read off a page but did not follow."""
+        nonlocal inferred
+        inferred = candidate
+
     cleaned = unwrap(url)
     if args.follow:
         # Before tor is even started: this, not the line above, is what will go
         # over the wire.
         report(f"  => {cleaned}")
-        result = resolve_through_tor(url, report)
+        settled = resolve_through_tor(url, report, note)
     else:
-        result = cleaned
+        settled = cleaned
 
-    report("unwrapped:")
+    result, label = chosen_result(settled, inferred, args.trust_inferred)
+    report(label)
     print(result)
 
     if not args.no_copy:

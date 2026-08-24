@@ -7,10 +7,13 @@ from types import SimpleNamespace
 import pytest
 
 from urldecode import (
+    INFERRED_LABEL,
+    UNWRAPPED_LABEL,
     TorCheckFailed,
     _forwarding_hop,
     _hop,
     bounded_text,
+    chosen_result,
     confirm_tor,
     follow,
     forwarding_target,
@@ -644,3 +647,58 @@ def test_an_uppercase_cid_is_stripped_like_the_lowercase_one():
 @pytest.mark.parametrize("name", ["ID", "Page", "V", "Q"])
 def test_case_folding_does_not_widen_the_rule_to_ordinary_names(name):
     assert unwrap(f"https://example.com/a?{name}=7") == f"https://example.com/a?{name}=7"
+
+
+# --- carrying an inferred candidate up to the caller -------------------------
+#
+# The candidate is found four levels below main(), and returning it as a hop
+# would make follow() request it. It travels up its own way instead, and the
+# choice of what to do with it is made in one place at the top.
+
+
+def test_an_inferred_candidate_is_noted_while_still_not_being_followed():
+    noted = []
+    hop = _forwarding_hop(JS_FORWARDING_PAGE, JS_FORWARDING_PAGE_URL, lambda _: None, noted.append)
+    assert hop is None
+    # Cleaned, so that what is noted is what the "??" line showed.
+    assert noted == [unwrap(JS_FORWARDING_TARGET)]
+
+
+def test_a_declared_refresh_is_never_noted_as_inferred():
+    # It is a hop, and follow() will resolve it. Nothing is being guessed.
+    html = '<meta http-equiv="refresh" content="0; url=https://news.example/a">'
+    noted = []
+    _forwarding_hop(html, "https://short.example/x", lambda _: None, noted.append)
+    assert noted == []
+
+
+def test_a_page_that_forwards_nowhere_notes_nothing():
+    noted = []
+    _forwarding_hop(CLIENT_RENDERED_LANDING_PAGE, LANDING_PAGE_URL, lambda _: None, noted.append)
+    assert noted == []
+
+
+def test_noting_is_optional():
+    assert _forwarding_hop(JS_FORWARDING_PAGE, JS_FORWARDING_PAGE_URL, lambda _: None) is None
+
+
+# --- choosing between the settled URL and the candidate ----------------------
+
+SETTLED = "https://short.example/kfCXO9"
+CANDIDATE = "https://news.example/story-123"
+
+
+def test_a_trusted_candidate_becomes_the_result():
+    assert chosen_result(SETTLED, CANDIDATE, trust=True) == (CANDIDATE, INFERRED_LABEL)
+
+
+def test_an_untrusted_candidate_leaves_the_settled_url_as_the_result():
+    assert chosen_result(SETTLED, CANDIDATE, trust=False) == (SETTLED, UNWRAPPED_LABEL)
+
+
+def test_trust_without_a_candidate_changes_nothing():
+    assert chosen_result(SETTLED, None, trust=True) == (SETTLED, UNWRAPPED_LABEL)
+
+
+def test_no_candidate_and_no_trust_is_the_ordinary_case():
+    assert chosen_result(SETTLED, None, trust=False) == (SETTLED, UNWRAPPED_LABEL)
