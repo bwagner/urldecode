@@ -11,6 +11,7 @@ from urldecode import (
     UNWRAPPED_LABEL,
     TorCheckFailed,
     _forwarding_hop,
+    _parser,
     _hop,
     bounded_text,
     chosen_result,
@@ -702,3 +703,10 @@ def test_trust_without_a_candidate_changes_nothing():
 
 def test_no_candidate_and_no_trust_is_the_ordinary_case():
     assert chosen_result(SETTLED, None, trust=False) == (SETTLED, UNWRAPPED_LABEL)
+
+
+def test_an_inferred_candidate_is_taken_unless_it_is_refused():
+    # The flag exists to decline the candidate, not to ask for it: a page that
+    # names where it forwards is answering the question the tool was asked.
+    assert _parser().parse_args([]).trust_inferred is True
+    assert _parser().parse_args(["--no-trust-inferred"]).trust_inferred is False

@@ -377,8 +377,8 @@ def _forwarding_hop(html, url, report, note=None):
     off-site anchor is this tool reading the markup rather than the page saying
     so, and is never returned as a hop: followed, a wrong guess would be
     indistinguishable from a fact, and nothing downstream could tell the
-    difference. It is shown, and handed to `note` for a caller that asked to be
-    given candidates - which decides what to do with it, four levels up.
+    difference. It is shown, and handed to `note`, which carries it past
+    follow() to the one place that decides what to do with it.
     """
     forward = forwarding_target(html, url)
     if forward is None:
@@ -595,16 +595,17 @@ def resolve_through_tor(url, report, note=None):
 def chosen_result(settled, inferred, trust):
     """Return the URL to print, and the label that says what kind it is.
 
-    A candidate is only ever an inference from a page's shape, so it becomes the
-    answer on request and never by default. Asking for it does nothing when
-    there is none to give.
+    A candidate read off a page's shape is the answer when there is one, since
+    it is the answer the user came for - but never silently: it is labelled for
+    what it is, and --no-trust-inferred keeps the URL that actually settled.
     """
     if trust and inferred is not None:
         return inferred, INFERRED_LABEL
     return settled, UNWRAPPED_LABEL
 
 
-def main(argv=None):
+def _parser():
+    """The CLI, built apart from main() so its defaults can be read in a test."""
     parser = argparse.ArgumentParser(
         description=__doc__,
         epilog=FOLLOW_EPILOG.format(launch_port=TOR_LAUNCH_PORT),
@@ -618,14 +619,19 @@ def main(argv=None):
         help="resolve shortener redirects over the network, through tor (see below)",
     )
     parser.add_argument(
-        "-t",
-        "--trust-inferred",
-        action="store_true",
-        help="with --follow, take a page's inferred forward (the ?? line) as the result",
+        "-T",
+        "--no-trust-inferred",
+        dest="trust_inferred",
+        action="store_false",
+        help="keep the URL that settled, even when a page names where it forwards (the ?? line)",
     )
     parser.add_argument("-n", "--no-copy", action="store_true", help="do not copy the result to the clipboard")
     parser.add_argument("-q", "--quiet", action="store_true", help="print only the resulting URL")
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv=None):
+    args = _parser().parse_args(argv)
 
     def report(message):
         """The trace goes to stderr; stdout carries the resulting URL alone."""
