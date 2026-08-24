@@ -82,9 +82,11 @@ unwrapped, so `l.facebook.com/l.php?u=...` and `google.com/url?q=...` both work
 without special-casing either. Nested wrappers are followed up to
 `MAX_UNWRAP_DEPTH`. A URL that is not a redirector is returned unchanged.
 
-**Strips tracking parameters, and only those.** Parameters are matched by name
-against `TRACKING_PARAMS` (`fbclid`, `gclid`, `msclkid`, `igshid`, `mc_eid`, ...),
-the `utm_` prefix, and the `clid`/`cid` suffixes. The suffix rule catches
+**Strips tracking parameters, and only those.** Parameters are matched by name,
+case-insensitively, against `TRACKING_PARAMS` (`fbclid`, `gclid`, `msclkid`,
+`igshid`, `mc_eid`, ...), the `utm_` prefix, and the `clid`/`cid` suffixes.
+Publishers capitalise these inconsistently, so `FBCLID` goes the same way as
+`fbclid`. The suffix rule catches
 per-publisher click ids that no list can keep up with, such as the `mrfcid` used
 by nzz.ch's `mrf.lu` shortener; the price is that a legitimate `cid` (category,
 content or customer id) is stripped too. Everything else survives, so links that
@@ -99,8 +101,23 @@ https://example.com/a
 ```
 
 Surviving parameters keep their raw text rather than being decoded and
-re-encoded, the fragment is preserved, and decoding uses `unquote` rather than
-`unquote_plus` so a literal `+` stays a `+`.
+re-encoded, and decoding uses `unquote` rather than `unquote_plus` so a literal
+`+` stays a `+`.
+
+Fragments are kept, with one exception. A fragment never reaches the server, so
+a marker in one is read by the page's own JavaScript on arrival - `#Echobox=...`
+does the same job as an `fbclid` by another route. A fragment that reads as
+`key=value` is therefore matched against the same rule as a query parameter and
+dropped if it is tracking:
+
+```console
+$ urldecode.py -q -n 'https://www.example.com/story-123?utm_source=Facebook#Echobox=1787588927'
+https://www.example.com/story-123
+```
+
+An ordinary anchor (`#section-3`) has no `=` and cannot be read as a name, so it
+is never at risk, and a functional pair (`#t=120` for a video timestamp,
+`#page=5`, `#:~:text=...`) survives because its name is not tracking.
 
 ## Following shorteners (`--follow`)
 
@@ -121,6 +138,7 @@ tor: exit node 185.220.101.19
   -> https://www.example.com/feuilleton/some-article-ld.123?utm_campaign=mrf-facebook-x&utm_source=facebook&utm_medium=social&mrfcid=20260101ExampleMrfClickId
   => https://www.example.com/feuilleton/some-article-ld.123
   .. 200 text/html, no redirect
+  .. no forward in the page: this is the destination
 unwrapped:
 https://www.example.com/feuilleton/some-article-ld.123
 ```
@@ -136,18 +154,59 @@ will go over the wire before anything does. The wrapper handed over an
 that no exact-name list would have known about, and none of them survived.
 
 Each hop is a HEAD request (falling back to a streamed GET where HEAD is
-refused), following `Location` without ever reading a page body, bounded by
-`MAX_FOLLOW_HOPS` and stopping early on a redirect cycle. Only real HTTP
-redirects are followed. Some shorteners instead answer `200` with a page that
-forwards you on a moment later, through JavaScript or a `<meta refresh>` - often
-showing an ad or a countdown while it does. Those settle at the shortener: there
-is no `Location` header to follow, and the real destination sits in the HTML
-body. The `..` line makes that visible, since you see a `200 text/html` where
-you expected a destination, but nothing can say more than that without reading
-the body this deliberately never downloads. **Tracking is
-stripped before every request**, so the shortener is never handed the `fbclid`
-that led you to it, and the text-level unwrap runs again after each hop, since
-hops routinely land on URLs carrying fresh `utm_*` junk.
+refused), following `Location`, bounded by `MAX_FOLLOW_HOPS` and stopping early
+on a redirect cycle. **Tracking is stripped before every request**, so the
+shortener is never handed the `fbclid` that led you to it, and the text-level
+unwrap runs again after each hop, since hops routinely land on URLs carrying
+fresh `utm_*` junk.
+
+### When there is no `Location` to follow
+
+Some shorteners answer `200` with a page that forwards you on a moment later,
+often showing an ad or a countdown while it does. There is no redirect header
+for that, so the chain settles at the shortener while the real destination sits
+in the HTML.
+
+When a hop settles on a `200` that says it is `text/html`, and only then, up to
+`MAX_BODY_BYTES` (64KB) of the page is read. It is parsed as markup, never
+executed, and nothing it references is fetched. What happens next depends on how
+the page says where it goes.
+
+**It declares a `<meta http-equiv="refresh">`.** The page states its own
+destination, so it is followed like any `Location` and printed as the usual
+`->` / `=>` pair.
+
+**It carries a single off-site link, with an `og:title` describing it.** That is
+this tool reading the page's shape, not the page saying so, so it is shown and
+not followed:
+
+```console
+  .. 200 text/html, no redirect
+  ?? forwards to https://www.example.com/some-article
+     The headline the page says it is about to show you
+```
+
+The result on stdout and the clipboard stays the URL that actually settled;
+copy the `??` line yourself if it looks right. Following it automatically would
+make a wrong guess indistinguishable from a fact, and unlike stopping early,
+that failure would be silent - the output shape is identical whether the guess
+was right or wrong.
+
+**Neither, or several links with no way to choose.** The page is reported as the
+destination, which is an answer rather than the absence of one:
+
+```console
+  .. 200 text/html, no redirect
+  .. no forward in the page: this is the destination
+```
+
+That last line is what separates "this is where you were going" from "it goes on
+and I cannot see how" - two situations the headers alone cannot tell apart.
+
+A page whose destination exists only inside its JavaScript, computed or fetched
+rather than written in the markup, is out of scope. Reading it properly needs a
+browser engine, which would end the single-file script, and pattern-matching
+script text works on the easy cases and fails silently on the rest.
 
 ### tor
 
@@ -198,6 +257,22 @@ is testable without a network or a mocking library:
 ```python
 follow("https://l.facebook.com/l.php?u=...", {"https://mrf.lu/2sW97": "https://example.com/a"}.get)
 ```
+
+Reading a forwarding page is pure too - HTML in, URL out - so it needs no
+network either:
+
+```python
+from urldecode import forwarding_target
+
+forwarding_target(html, "https://short.example/abc")
+# Forward(url="https://news.example/story", declared=False, title="The headline")
+# ... or None, when the page does not forward on
+```
+
+`declared` is provenance, not confidence: `True` means the page said so in a
+`<meta refresh>`, `False` means it was inferred from a sole off-site link.
+`meta_refresh_target(html, base)`, `sole_offsite_anchor(html, base)` and
+`og_title(html)` are available individually.
 
 `pyperclip` is imported lazily, so importing the module does not require it.
 

@@ -10,6 +10,8 @@ import socket
 import sys
 import tempfile
 import urllib.parse as ul
+from html.parser import HTMLParser
+from typing import NamedTuple, Optional
 
 URL_SCHEMES = ("https://", "http://")
 PARAM_SEP = "&"
@@ -34,6 +36,9 @@ TRACKING_PARAMS = frozenset(
         "_gl",
         "ref_src",
         "ref_url",
+        # Publishers using Echobox tag their posts with a "#Echobox=<id>"
+        # fragment, read by its JavaScript on arrival rather than by the server.
+        "echobox",
     }
 )
 TRACKING_PREFIXES = ("utm_",)
@@ -133,6 +138,14 @@ def _redirect_target(url):
 
 
 def is_tracking(name):
+    """True when a parameter or fragment name identifies the click, not the content.
+
+    The denylist, the prefix and the suffixes are all written in lower case and
+    the name is folded to match: publishers capitalise these inconsistently
+    ("Echobox" in a fragment, "fbclid" in a query), and the same marker should
+    not survive one link and not the next because of a capital letter.
+    """
+    name = name.lower()
     return (
         name in TRACKING_PARAMS
         or name.startswith(TRACKING_PREFIXES)
@@ -150,16 +163,226 @@ def unredirect(url):
     return url
 
 
+def _clean_fragment(fragment):
+    """Drop a fragment that is a tracking key=value pair; keep every other.
+
+    A fragment is never sent to the server, so a marker in one is read by the
+    page's own JavaScript on arrival - the same job as an fbclid, by another
+    route. An ordinary anchor ("#section-3") has no "=" and cannot be read as a
+    name, so it is never at risk; a functional pair ("#t=120") keeps its
+    fragment because its name is not tracking.
+    """
+    name, separator, _value = fragment.partition(KV_SEP)
+    if separator and is_tracking(ul.unquote(name)):
+        return ""
+    return fragment
+
+
 def strip_tracking(url):
     """Drop tracking parameters, keeping every other parameter byte-identical."""
     parts = ul.urlsplit(url)
     kept = [pair for name, _value, pair in _params(parts.query) if not is_tracking(name)]
-    return ul.urlunsplit(parts._replace(query=PARAM_SEP.join(kept)))
+    return ul.urlunsplit(
+        parts._replace(query=PARAM_SEP.join(kept), fragment=_clean_fragment(parts.fragment))
+    )
 
 
 def unwrap(url):
     """Return the real destination of url, without tracking parameters."""
     return strip_tracking(unredirect(url))
+
+
+# --- reading a page that forwards on -----------------------------------------
+#
+# A shortener answering 200 text/html has not necessarily arrived; the page may
+# forward on. Finding that out means reading a body, which the header-only path
+# deliberately never does, so it is fenced in: the markup is parsed, never
+# executed, and nothing it references is fetched.
+
+META_TAG = "meta"
+ANCHOR_TAG = "a"
+HTTP_EQUIV_ATTRIBUTE = "http-equiv"
+CONTENT_ATTRIBUTE = "content"
+PROPERTY_ATTRIBUTE = "property"
+HREF_ATTRIBUTE = "href"
+REFRESH_EQUIV = "refresh"
+REFRESH_URL_KEY = "url"
+REFRESH_SEP = ";"
+OG_TITLE_PROPERTY = "og:title"
+QUOTE_CHARACTERS = "\"'"
+SAME_PAGE_NETLOCS = ("",)
+OK_STATUS = 200
+HTML_CONTENT_TYPE = "text/html"
+# A fence, not a budget: the forwarding pages seen so far are 2-14KB, and the
+# head is all that is ever needed.
+MAX_BODY_BYTES = 64 * 1024
+BODY_ENCODING = "utf-8"
+DECODE_ERRORS = "replace"
+FORWARD_MARKER = "  ?? forwards to"
+TITLE_INDENT = "     "
+DESTINATION_MESSAGE = "  .. no forward in the page: this is the destination"
+
+
+class Forward(NamedTuple):
+    """Where a page goes next, and how confidently that is known.
+
+    `declared` separates the two ways of knowing. A <meta refresh> is the page
+    stating its own destination, and can be followed like a Location header. A
+    sole off-site anchor is an inference from the page's shape, and is only ever
+    reported.
+    """
+
+    url: str
+    declared: bool
+    title: Optional[str]
+
+
+class _PageFacts(HTMLParser):
+    """Collect the few facts about a page that say where it forwards to."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.refresh = None
+        self.title = None
+        self.hrefs = []
+
+    def handle_starttag(self, tag, attrs):
+        # HTMLParser lowercases tag and attribute names, but not their values.
+        attributes = {name: value or "" for name, value in attrs}
+        if tag == META_TAG:
+            self._read_meta(attributes)
+        elif tag == ANCHOR_TAG and attributes.get(HREF_ATTRIBUTE):
+            self.hrefs.append(attributes[HREF_ATTRIBUTE])
+
+    def _read_meta(self, attributes):
+        if attributes.get(HTTP_EQUIV_ATTRIBUTE, "").lower() == REFRESH_EQUIV:
+            self.refresh = attributes.get(CONTENT_ATTRIBUTE, "")
+        elif attributes.get(PROPERTY_ATTRIBUTE, "").lower() == OG_TITLE_PROPERTY:
+            self.title = attributes.get(CONTENT_ATTRIBUTE)
+
+
+def _page_facts(html):
+    facts = _PageFacts()
+    facts.feed(html)
+    return facts
+
+
+def _refresh_url(content, base_url):
+    """Read the target out of a <meta refresh> content attribute.
+
+    The attribute reads "<seconds>; url=<target>"; a bare "<seconds>" reloads
+    this same page and forwards nowhere. Only the first ";" and the first "="
+    are split on, so a target containing either character survives.
+    """
+    if content is None:
+        return None
+    _delay, separator, rest = content.partition(REFRESH_SEP)
+    if not separator:
+        return None
+    key, separator, value = rest.strip().partition(KV_SEP)
+    if not separator or key.strip().lower() != REFRESH_URL_KEY:
+        return None
+    target = value.strip().strip(QUOTE_CHARACTERS)
+    return ul.urljoin(base_url, target) if target else None
+
+
+def meta_refresh_target(html, base_url):
+    """Return the URL a <meta refresh> forwards to, or None if there is none."""
+    return _refresh_url(_page_facts(html).refresh, base_url)
+
+
+def _sole_offsite(facts, base_url):
+    host = ul.urlsplit(base_url).netloc
+    targets = []
+    for href in facts.hrefs:
+        target = ul.urljoin(base_url, href)
+        if ul.urlsplit(target).netloc not in SAME_PAGE_NETLOCS + (host,) and target not in targets:
+            targets.append(target)
+    return targets[0] if len(targets) == 1 else None
+
+
+def sole_offsite_anchor(html, base_url):
+    """Return the single off-site URL a page links to, or None.
+
+    One link off the page is a forward; none is a page rendering its own
+    content, and several is a choice this tool has no basis for making. The
+    markup is parsed rather than pattern-matched, and the difference is not
+    academic: a landing page names a dozen URLs inside its scripts and links to
+    none of them, so matching on text offers a confident wrong answer.
+    """
+    return _sole_offsite(_page_facts(html), base_url)
+
+
+def og_title(html):
+    """Return the page's og:title - its own claim about what it is showing."""
+    return _page_facts(html).title
+
+
+def forwarding_target(html, base_url):
+    """Return where this page forwards to, or None if it does not forward.
+
+    A <meta refresh> stands on its own, since the page states its destination. A
+    sole off-site anchor is trusted only when an og:title corroborates it: a
+    page about to show you somewhere else describes where that is, while a
+    paywall or an error page that happens to carry one link does not.
+    """
+    facts = _page_facts(html)
+    declared = _refresh_url(facts.refresh, base_url)
+    if declared is not None:
+        return Forward(declared, True, facts.title)
+    inferred = _sole_offsite(facts, base_url)
+    if inferred is not None and facts.title:
+        return Forward(inferred, False, facts.title)
+    return None
+
+
+def worth_reading(response):
+    """True when a settled response is a page that could still forward on.
+
+    Anything else - an error page, a PDF, a response that will not say what it
+    is - stays unopened.
+    """
+    if response.status_code != OK_STATUS:
+        return False
+    content_type = response.headers.get(CONTENT_TYPE_HEADER, "")
+    return content_type.split(CONTENT_TYPE_SEP)[0].strip().lower() == HTML_CONTENT_TYPE
+
+
+def bounded_text(chunks, limit=MAX_BODY_BYTES):
+    """Decode at most `limit` bytes of a streamed body.
+
+    The bytes are collected first and decoded once at the end, so a character
+    split across two chunks survives. The cap is what keeps "read the page" from
+    becoming "download the page"; the charset the page declares is ignored,
+    which can garble a title from a legacy-encoded page but never a URL.
+    """
+    read = bytearray()
+    for chunk in chunks:
+        read += chunk[: limit - len(read)]
+        if len(read) >= limit:
+            break
+    return read.decode(BODY_ENCODING, errors=DECODE_ERRORS)
+
+
+def _forwarding_hop(html, url, report):
+    """Return the hop a page declares, or report what it shows and settle.
+
+    A <meta refresh> is the page stating its destination, so it is returned
+    silently and follow() prints it exactly as it prints a Location. A sole
+    off-site anchor is this tool reading the markup rather than the page saying
+    so, and is only ever shown: followed, a wrong guess would be indistinguish-
+    able from a fact, and nothing downstream could tell the difference.
+    """
+    forward = forwarding_target(html, url)
+    if forward is None:
+        report(DESTINATION_MESSAGE)
+        return None
+    if forward.declared:
+        return forward.url
+    report(f"{FORWARD_MARKER} {unwrap(forward.url)}")
+    if forward.title:
+        report(f"{TITLE_INDENT}{forward.title}")
+    return None
 
 
 def _clipboard():
@@ -205,9 +428,9 @@ def _proxy_url(socks_port):
 def _hop(response, report):
     """Return the Location, or report why this URL settled and return None.
 
-    Only the status and headers are read, never the body, so a page that
-    redirects through JavaScript or <meta refresh> settles here. Saying so is
-    all that can honestly be said without downloading it.
+    Only the status and headers are read here. A page that forwards on through
+    <meta refresh> or JavaScript settles at this layer, and the caller decides
+    whether its body is worth opening to find out which of the two it is.
     """
     location = (
         response.headers.get(LOCATION_HEADER)
@@ -220,8 +443,20 @@ def _hop(response, report):
     return location
 
 
+def _read_forward(client, url, report):
+    """Open a capped prefix of a page and see whether it forwards on."""
+    with client.stream("GET", url) as streamed:
+        html = bounded_text(streamed.iter_bytes())
+    return _forwarding_hop(html, url, report)
+
+
 def tor_resolver(socks_port, report):
-    """Return a resolve(url) that reads one redirect hop through tor."""
+    """Return a resolve(url) that reads one hop through tor.
+
+    Headers alone answer the question for a redirect. A page that settles is
+    opened only when it is a 200 that says it is HTML, and then only far enough
+    to see whether it forwards on.
+    """
     import httpx
 
     client = httpx.Client(
@@ -234,10 +469,19 @@ def tor_resolver(socks_port, report):
     def resolve(url):
         response = client.head(url)
         if response.status_code in METHOD_NOT_ALLOWED:
-            # Some hosts refuse HEAD. Stream the GET so the body is never read.
+            # Some hosts refuse HEAD. Stream the GET so nothing is read beyond
+            # what the body pass below asks for.
             with client.stream("GET", url) as streamed:
-                return _hop(streamed, report)
-        return _hop(response, report)
+                location = _hop(streamed, report)
+                if location is not None:
+                    return location
+                if not worth_reading(streamed):
+                    return None
+                return _forwarding_hop(bounded_text(streamed.iter_bytes()), url, report)
+        location = _hop(response, report)
+        if location is not None:
+            return location
+        return _read_forward(client, url, report) if worth_reading(response) else None
 
     return resolve
 
