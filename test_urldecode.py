@@ -2,11 +2,13 @@
 
 import socket
 import urllib.parse as ul
+from types import SimpleNamespace
 
 import pytest
 
 from urldecode import (
     TorCheckFailed,
+    _hop,
     confirm_tor,
     follow,
     socks_port_open,
@@ -239,3 +241,36 @@ def test_follow_reports_each_cleaned_url_it_produces():
     reported = []
     follow("https://example.com/a", resolver_from(chain), report=reported.append)
     assert reported == ["  => https://example.com/b"]
+
+
+# --- reporting why a URL settled --------------------------------------------
+
+
+def response(status_code, **headers):
+    """A stand-in for an httpx response: _hop only reads status and headers."""
+    return SimpleNamespace(status_code=status_code, headers=headers)
+
+
+def test_a_redirect_yields_its_location_and_reports_nothing():
+    messages = []
+    location = _hop(response(301, location="https://example.com/b"), messages.append)
+    assert location == "https://example.com/b"
+    assert messages == []
+
+
+def test_a_settled_url_reports_its_status_and_type():
+    messages = []
+    assert _hop(response(200, **{"content-type": "text/html; charset=utf-8"}), messages.append) is None
+    assert messages == ["  .. 200 text/html, no redirect"]
+
+
+def test_a_settled_url_without_a_content_type_still_reports():
+    messages = []
+    assert _hop(response(204), messages.append) is None
+    assert "204" in messages[0]
+
+
+def test_a_redirect_without_a_location_header_is_reported_not_silent():
+    messages = []
+    assert _hop(response(302), messages.append) is None
+    assert messages != []

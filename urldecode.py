@@ -2,7 +2,7 @@
 # /// script
 # dependencies = ["pyperclip", "httpx[socks]", "stem"]
 # ///
-"""Unwrap a redirector link (Facebook, Google, ...) and strip tracking parameters."""
+"""Find where a link really goes, and strip the tracking on the way."""
 
 import argparse
 import shutil
@@ -67,6 +67,9 @@ MAX_FOLLOW_HOPS = 10
 REDIRECT_STATUSES = range(300, 400)
 METHOD_NOT_ALLOWED = (405, 501)
 LOCATION_HEADER = "location"
+CONTENT_TYPE_HEADER = "content-type"
+CONTENT_TYPE_SEP = ";"
+UNKNOWN_CONTENT_TYPE = "unknown type"
 # curl's --socks5-hostname equivalent: DNS is resolved by the exit node, not here.
 SOCKS_SCHEME = "socks5h"
 # A plain, current UA: shorteners behind a WAF reject the default one, and an
@@ -199,13 +202,25 @@ def _proxy_url(socks_port):
     return f"{SOCKS_SCHEME}://{TOR_SOCKS_HOST}:{socks_port}"
 
 
-def _location(response):
-    if response.status_code not in REDIRECT_STATUSES:
-        return None
-    return response.headers.get(LOCATION_HEADER)
+def _hop(response, report):
+    """Return the Location, or report why this URL settled and return None.
+
+    Only the status and headers are read, never the body, so a page that
+    redirects through JavaScript or <meta refresh> settles here. Saying so is
+    all that can honestly be said without downloading it.
+    """
+    location = (
+        response.headers.get(LOCATION_HEADER)
+        if response.status_code in REDIRECT_STATUSES
+        else None
+    )
+    if location is None:
+        content_type = response.headers.get(CONTENT_TYPE_HEADER, UNKNOWN_CONTENT_TYPE)
+        report(f"  .. {response.status_code} {content_type.split(CONTENT_TYPE_SEP)[0]}, no redirect")
+    return location
 
 
-def tor_resolver(socks_port):
+def tor_resolver(socks_port, report):
     """Return a resolve(url) that reads one redirect hop through tor."""
     import httpx
 
@@ -221,8 +236,8 @@ def tor_resolver(socks_port):
         if response.status_code in METHOD_NOT_ALLOWED:
             # Some hosts refuse HEAD. Stream the GET so the body is never read.
             with client.stream("GET", url) as streamed:
-                return _location(streamed)
-        return _location(response)
+                return _hop(streamed, report)
+        return _hop(response, report)
 
     return resolve
 
@@ -304,7 +319,7 @@ def resolve_through_tor(url, report):
     port, started = tor_socks_port(report)
     try:
         confirm_tor(port, started is not None, report)
-        resolve = tor_resolver(port)
+        resolve = tor_resolver(port, report)
 
         def reporting_resolve(target):
             location = resolve(target)

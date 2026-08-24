@@ -1,7 +1,16 @@
 # urldecode
 
-Unwrap a redirector link and strip its tracking parameters, leaving the URL the
-link actually points at.
+Find out where a link really goes, and get there without the tracking.
+
+Unwraps redirector links that carry their destination in a query parameter -
+Facebook's `l.php?u=`, Google's `/url?q=`, and anything shaped like them - as
+pure text, and strips tracking parameters, including per-publisher click ids no
+denylist knows about. With `--follow` it also resolves shorteners whose target
+only the server knows, such as bit.ly, tinyurl or t.co, over tor - cleaning the
+URL *before* each request, so the shortener never receives the click id that
+sent you there.
+
+No domain lists: any query parameter holding a URL, any redirect.
 
 ```console
 $ urldecode.py -q 'https://l.facebook.com/l.php?u=https%3A%2F%2Fmrf.lu%2F2sW97%3Ffbclid%3DIwZXh0bgNhZW0Example&h=AT0Example&c[0]=AUDExample'
@@ -111,20 +120,31 @@ tor: nothing on port 9050, starting a private instance
 tor: exit node 185.220.101.19
   -> https://www.example.com/feuilleton/some-article-ld.123?utm_campaign=mrf-facebook-x&utm_source=facebook&utm_medium=social&mrfcid=20260101ExampleMrfClickId
   => https://www.example.com/feuilleton/some-article-ld.123
+  .. 200 text/html, no redirect
 unwrapped:
 https://www.example.com/feuilleton/some-article-ld.123
 ```
 
 Every stage reads the same way and comes in pairs: `->` is the raw URL that
 came back, `=>` is the same URL cleaned, and the `=>` is what gets requested
-next. The first pair is printed before tor is even started, so you can see what
+next. A final `..` line reports the status and content type of the URL that did
+not redirect, so the chain ends by saying why it ended rather than just
+stopping - a `404` or an unexpected content type shows up instead of being
+silently presented as the destination. The first pair is printed before tor is even started, so you can see what
 will go over the wire before anything does. The wrapper handed over an
 `fbclid`, the shortener handed back four more parameters including the `mrfcid`
 that no exact-name list would have known about, and none of them survived.
 
 Each hop is a HEAD request (falling back to a streamed GET where HEAD is
 refused), following `Location` without ever reading a page body, bounded by
-`MAX_FOLLOW_HOPS` and stopping early on a redirect cycle. **Tracking is
+`MAX_FOLLOW_HOPS` and stopping early on a redirect cycle. Only real HTTP
+redirects are followed. Some shorteners instead answer `200` with a page that
+forwards you on a moment later, through JavaScript or a `<meta refresh>` - often
+showing an ad or a countdown while it does. Those settle at the shortener: there
+is no `Location` header to follow, and the real destination sits in the HTML
+body. The `..` line makes that visible, since you see a `200 text/html` where
+you expected a destination, but nothing can say more than that without reading
+the body this deliberately never downloads. **Tracking is
 stripped before every request**, so the shortener is never handed the `fbclid`
 that led you to it, and the text-level unwrap runs again after each hop, since
 hops routinely land on URLs carrying fresh `utm_*` junk.
@@ -187,3 +207,7 @@ follow("https://l.facebook.com/l.php?u=...", {"https://mrf.lu/2sW97": "https://e
 uv run --with pytest pytest -q
 uvx ruff check .
 ```
+
+## License
+
+MIT - see [LICENSE](LICENSE).
