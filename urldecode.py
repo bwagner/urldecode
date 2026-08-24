@@ -34,6 +34,12 @@ TRACKING_PARAMS = frozenset(
 )
 TRACKING_PREFIXES = ("utm_",)
 
+# Publishers invent their own click ids faster than a list can track them
+# (nzz.ch's mrf.lu shortener uses "mrfcid"). The cost of catching them by
+# suffix is that a legitimate "cid" - category, content, customer id - is
+# stripped too; that is an accepted trade-off.
+TRACKING_SUFFIXES = ("clid", "cid")
+
 # A redirector wrapping a redirector is rare; a cycle should not hang the tool.
 MAX_UNWRAP_DEPTH = 5
 
@@ -56,7 +62,11 @@ def _redirect_target(url):
 
 
 def is_tracking(name):
-    return name in TRACKING_PARAMS or name.startswith(TRACKING_PREFIXES)
+    return (
+        name in TRACKING_PARAMS
+        or name.startswith(TRACKING_PREFIXES)
+        or name.endswith(TRACKING_SUFFIXES)
+    )
 
 
 def unredirect(url):

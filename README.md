@@ -63,9 +63,12 @@ without special-casing either. Nested wrappers are followed up to
 `MAX_UNWRAP_DEPTH`. A URL that is not a redirector is returned unchanged.
 
 **Strips tracking parameters, and only those.** Parameters are matched by name
-against `TRACKING_PARAMS` (`fbclid`, `gclid`, `msclkid`, `igshid`, `mc_eid`, ...)
-plus the `utm_` prefix. Everything else survives, so links that need their query
-string keep working:
+against `TRACKING_PARAMS` (`fbclid`, `gclid`, `msclkid`, `igshid`, `mc_eid`, ...),
+the `utm_` prefix, and the `clid`/`cid` suffixes. The suffix rule catches
+per-publisher click ids that no list can keep up with, such as the `mrfcid` used
+by nzz.ch's `mrf.lu` shortener; the price is that a legitimate `cid` (category,
+content or customer id) is stripped too. Everything else survives, so links that
+need their query string keep working:
 
 ```console
 $ urldecode.py -q 'https://www.youtube.com/watch?v=dQw4w9WgXcQ&utm_source=newsletter&fbclid=ABC'

@@ -46,6 +46,26 @@ def test_only_tracking_params_are_removed():
     assert unwrap(url) == "https://example.com/p?id=7&page=2"
 
 
+def test_publisher_click_id_is_removed_by_suffix():
+    url = (
+        "https://example.com/a-ld.123"
+        "?utm_campaign=x-facebook-y&utm_source=facebook&utm_medium=social"
+        "&mrfcid=20260101ExampleMrfClickIdForTestsOnly"
+    )
+    assert unwrap(url) == "https://example.com/a-ld.123"
+
+
+@pytest.mark.parametrize("name", ["mrfcid", "fbclid", "gclid", "somevendorclid", "othercid"])
+def test_click_id_suffixes_are_treated_as_tracking(name):
+    assert unwrap(f"https://example.com/a?id=7&{name}=ABC123") == "https://example.com/a?id=7"
+
+
+def test_a_bare_cid_is_stripped_too():
+    # Deliberate trade-off of the suffix heuristic: "cid" is also a legitimate
+    # abbreviation (category/content/customer id), and those are lost as well.
+    assert unwrap("https://example.com/a?cid=7") == "https://example.com/a"
+
+
 def test_url_without_query_is_left_alone():
     assert strip_tracking("https://example.com/a") == "https://example.com/a"
 
