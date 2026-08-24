@@ -1,42 +1,118 @@
 #!/usr/bin/env -S uv run --script
 # /// script
-# requires-python = ">=3.12"
 # dependencies = ["pyperclip"]
 # ///
-import re
-import sys
+"""Unwrap a redirector link (Facebook, Google, ...) and strip tracking parameters."""
+
+import argparse
 import urllib.parse as ul
 
-import pyperclip
+URL_SCHEMES = ("https://", "http://")
+PARAM_SEP = "&"
+KV_SEP = "="
+
+# Parameters that identify the click, not the content.
+TRACKING_PARAMS = frozenset(
+    {
+        "fbclid",
+        "gclid",
+        "dclid",
+        "msclkid",
+        "yclid",
+        "twclid",
+        "ttclid",
+        "igshid",
+        "mc_cid",
+        "mc_eid",
+        "vero_id",
+        "s_kwcid",
+        "_ga",
+        "_gl",
+        "ref_src",
+        "ref_url",
+    }
+)
+TRACKING_PREFIXES = ("utm_",)
+
+# A redirector wrapping a redirector is rare; a cycle should not hang the tool.
+MAX_UNWRAP_DEPTH = 5
 
 
-def urlescape(url):
-    return ul.unquote_plus(url)
+def _params(query):
+    """Yield (decoded name, decoded value, raw pair) for each pair in a query string."""
+    for pair in query.split(PARAM_SEP):
+        if not pair:
+            continue
+        name, _, value = pair.partition(KV_SEP)
+        yield ul.unquote(name), ul.unquote(value), pair
+
+
+def _redirect_target(url):
+    """Return the URL this one redirects to, or None if it is not a redirector."""
+    for _name, value, _pair in _params(ul.urlsplit(url).query):
+        if value.startswith(URL_SCHEMES):
+            return value
+    return None
+
+
+def is_tracking(name):
+    return name in TRACKING_PARAMS or name.startswith(TRACKING_PREFIXES)
 
 
 def unredirect(url):
-    return url[re.search("https?", url[1:]).start() + 1 :]
+    """Follow redirector wrappers down to the target URL, textually."""
+    for _ in range(MAX_UNWRAP_DEPTH):
+        target = _redirect_target(url)
+        if target is None:
+            break
+        url = target
+    return url
 
 
-def unparametrize(url):
-    return url[: url.index("?")] if "?" in url else url
+def strip_tracking(url):
+    """Drop tracking parameters, keeping every other parameter byte-identical."""
+    parts = ul.urlsplit(url)
+    kept = [pair for name, _value, pair in _params(parts.query) if not is_tracking(name)]
+    return ul.urlunsplit(parts._replace(query=PARAM_SEP.join(kept)))
 
 
-def main():
-    if len(sys.argv) == 1:
-        o = pyperclip.paste()
-        frm = "clipboard"
+def unwrap(url):
+    """Return the real destination of url, without tracking parameters."""
+    return strip_tracking(unredirect(url))
+
+
+def _clipboard():
+    import pyperclip
+
+    return pyperclip
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("url", nargs="?", help="URL to unwrap (default: read the clipboard)")
+    parser.add_argument("-n", "--no-copy", action="store_true", help="do not copy the result to the clipboard")
+    parser.add_argument("-q", "--quiet", action="store_true", help="print only the resulting URL")
+    args = parser.parse_args(argv)
+
+    if args.url:
+        url, source = args.url, "command line"
     else:
-        o = sys.argv[1]
-        frm = "command line"
-    print(f"original from {frm}:\n{o}\n")
-    s = urlescape(o)
-    print(f"escaped:\n{s}\n")
-    t = unredirect(s)
-    print(f"unredirected:\n{t}\n")
-    p = unparametrize(t)
-    print(f"unparametrized (is now in clipbord):\n{p}\n")
-    pyperclip.copy(p)
+        url, source = _clipboard().paste(), "clipboard"
+
+    result = unwrap(url)
+
+    if not args.quiet:
+        print(f"original from {source}:\n{url}\n")
+        target = unredirect(url)
+        if target != url:
+            print(f"redirect target:\n{target}\n")
+        print("unwrapped:")
+    print(result)
+
+    if not args.no_copy:
+        _clipboard().copy(result)
+        if not args.quiet:
+            print("\n(copied to clipboard)")
 
 
 if __name__ == "__main__":
