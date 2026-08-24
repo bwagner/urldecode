@@ -1,10 +1,19 @@
 """Tests for urldecode: unwrapping redirector links and stripping tracking params."""
 
+import socket
 import urllib.parse as ul
 
 import pytest
 
-from urldecode import strip_tracking, unredirect, unwrap
+from urldecode import (
+    TorCheckFailed,
+    confirm_tor,
+    follow,
+    socks_port_open,
+    strip_tracking,
+    unredirect,
+    unwrap,
+)
 
 # A real l.facebook.com wrapper, with the click-identifying tokens (fbclid, h,
 # c[]) replaced by synthetic values of the same shape and character set.
@@ -103,3 +112,130 @@ def test_output_is_a_parseable_absolute_url():
     assert parts.scheme == "https"
     assert parts.netloc == "mrf.lu"
     assert parts.query == ""
+
+
+# --- following redirects over the network -----------------------------------
+#
+# follow() takes its resolver as a parameter: resolve(url) returns the Location
+# of a single hop, or None when the URL does not redirect. That keeps every
+# test below offline - no network, no mocks, just a dict.
+
+
+def resolver_from(chain, calls=None):
+    """Build a resolver over a {url: next_url} mapping, recording its calls."""
+
+    def resolve(url):
+        if calls is not None:
+            calls.append(url)
+        return chain.get(url)
+
+    return resolve
+
+
+def test_follow_returns_the_url_unchanged_when_nothing_redirects():
+    assert follow("https://example.com/a", resolver_from({})) == "https://example.com/a"
+
+
+def test_follow_strips_the_tracking_each_hop_adds():
+    wrapper = (
+        "https://l.facebook.com/l.php"
+        "?u=https%3A%2F%2Fmrf.lu%2F2sW97%3Ffbclid%3DIwZXh0bgNhZW0ExampleClickId"
+        "&h=AT0ExampleRedirectSignature"
+    )
+    chain = {
+        "https://mrf.lu/2sW97": (
+            "https://example.com/a-ld.123"
+            "?utm_campaign=x-facebook-y&utm_source=facebook&utm_medium=social"
+            "&mrfcid=20260101ExampleMrfClickIdForTestsOnly"
+        )
+    }
+    assert follow(wrapper, resolver_from(chain)) == "https://example.com/a-ld.123"
+
+
+def test_follow_never_sends_tracking_parameters_to_the_resolver():
+    wrapper = (
+        "https://l.facebook.com/l.php"
+        "?u=https%3A%2F%2Fmrf.lu%2F2sW97%3Ffbclid%3DIwZXh0bgNhZW0ExampleClickId"
+    )
+    calls = []
+    follow(wrapper, resolver_from({}, calls))
+    assert calls == ["https://mrf.lu/2sW97"]
+    assert not any("fbclid" in c for c in calls)
+
+
+def test_follow_resolves_a_relative_location_header():
+    chain = {"https://example.com/a": "/final?utm_source=x"}
+    assert follow("https://example.com/a", resolver_from(chain)) == "https://example.com/final"
+
+
+def test_follow_stops_after_max_hops():
+    calls = []
+
+    def endless(url):
+        calls.append(url)
+        return f"{url}x"
+
+    follow("https://example.com/a", endless, max_hops=3)
+    assert len(calls) == 3
+
+
+def test_follow_terminates_on_a_redirect_cycle():
+    chain = {
+        "https://example.com/a": "https://example.com/b",
+        "https://example.com/b": "https://example.com/a",
+    }
+    calls = []
+    result = follow("https://example.com/a", resolver_from(chain, calls))
+    assert result in ("https://example.com/a", "https://example.com/b")
+    assert len(calls) < 4  # stopped on the repeat, not by exhausting max_hops
+
+
+# --- detecting a running tor ------------------------------------------------
+
+
+def test_socks_port_open_detects_a_listening_socket():
+    with socket.socket() as server:
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        assert socks_port_open("127.0.0.1", server.getsockname()[1]) is True
+
+
+def test_socks_port_open_is_false_when_nothing_listens():
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    assert socks_port_open("127.0.0.1", port) is False
+
+
+# --- refusing to use a proxy that is not confirmed tor -----------------------
+
+
+def failing_check(_socks_port):
+    raise TorCheckFailed("could not reach the check service")
+
+
+def test_an_unconfirmed_preexisting_port_aborts():
+    # We did not start it, so it could be any proxy: refusing is the whole point.
+    with pytest.raises(SystemExit):
+        confirm_tor(9050, we_started_it=False, report=lambda _: None, check=failing_check)
+
+
+def test_an_instance_we_started_survives_a_failed_check():
+    # We watched this one bootstrap, so a check that cannot complete is a
+    # warning, not a reason to throw the run away.
+    messages = []
+    confirm_tor(9250, we_started_it=True, report=messages.append, check=failing_check)
+    assert any("could not reach" in m for m in messages)
+
+
+def test_a_confirmed_exit_node_is_reported():
+    messages = []
+    confirm_tor(9050, we_started_it=False, report=messages.append, check=lambda _: "204.8.96.158")
+    assert any("204.8.96.158" in m for m in messages)
+
+
+def test_follow_reports_each_cleaned_url_it_produces():
+    chain = {"https://example.com/a": "https://example.com/b?fbclid=X"}
+    reported = []
+    follow("https://example.com/a", resolver_from(chain), report=reported.append)
+    assert reported == ["  => https://example.com/b"]
