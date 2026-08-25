@@ -12,6 +12,7 @@ import pytest
 from urldecode import (
     AMBIGUOUS_MESSAGE,
     BLOCKED_LABEL,
+    BROWSER_HEADERS,
     BLOCKING_STATUSES,
     DEFAULT_SCHEME,
     DESTINATION_MESSAGE,
@@ -26,6 +27,8 @@ from urldecode import (
     UNREACHED_LABEL,
     UNREAD_MESSAGE,
     UNWRAPPED_LABEL,
+    USER_AGENTS,
+    USER_AGENT_HEADER,
     TorCheckFailed,
     _proxy_url,
     _forwarding_hop,
@@ -38,6 +41,8 @@ from urldecode import (
     forwarding_target,
     is_blocked,
     needs_get,
+    request_headers,
+    user_agent,
     meta_refresh_target,
     named_offsite_anchor,
     no_forward_message,
@@ -1253,3 +1258,56 @@ def test_a_failure_names_its_reason():
     line = REQUEST_FAILED_MESSAGE.format(reason="UnsupportedProtocol: missing an http://")
     assert "UnsupportedProtocol" in line
     assert line.startswith("  ..")
+
+
+# --- a fresh identity on every attempt ---------------------------------------
+# A retry gets a new exit node, and used to carry the one thing the new node
+# could not disguise: an identical User-Agent, eight times over. These pin the
+# rotation, not the strings - which Chrome versions are current is a value that
+# goes stale, and asserting it would only pin today.
+
+CHROME_UA = re.compile(
+    r"^Mozilla/5\.0 \(.+\) AppleWebKit/537\.36 "
+    r"\(KHTML, like Gecko\) Chrome/\d+\.0\.0\.0 Safari/537\.36$"
+)
+
+
+def test_every_identity_is_a_well_formed_chrome_ua():
+    # A malformed UA is worse than a boring one: it is a fingerprint of its own.
+    assert USER_AGENTS
+    for candidate in USER_AGENTS:
+        assert CHROME_UA.match(candidate), candidate
+
+
+def test_a_whole_run_of_retries_never_repeats_an_identity():
+    # The list is deliberately longer than the attempt cap, so the worst case -
+    # a host refusing every circuit - still shows a different UA each time.
+    used = [user_agent(attempt) for attempt in range(MAX_BLOCKED_ATTEMPTS)]
+    assert len(set(used)) == len(used)
+
+
+def test_consecutive_attempts_differ():
+    assert user_agent(0) != user_agent(1)
+
+
+def test_the_rotation_wraps_rather_than_running_out():
+    # attempt is not bounded by the cap: -a can raise it past the list length.
+    assert user_agent(len(USER_AGENTS)) == user_agent(0)
+    assert user_agent(len(USER_AGENTS) + 3) == user_agent(3)
+
+
+def test_the_headers_carry_this_attempts_identity():
+    assert request_headers(2)[USER_AGENT_HEADER] == user_agent(2)
+
+
+def test_the_headers_keep_the_rest_of_the_browser_set():
+    headers = request_headers(0)
+    for name, value in BROWSER_HEADERS.items():
+        assert headers[name] == value
+
+
+def test_building_headers_leaves_the_shared_set_alone():
+    # A UA written into BROWSER_HEADERS by accident would pin attempt 0's
+    # identity onto every later attempt, silently undoing the rotation.
+    request_headers(1)
+    assert USER_AGENT_HEADER not in BROWSER_HEADERS

@@ -335,6 +335,14 @@ Requests also carry the header set a browser sends (`Accept`,
 `User-Agent` alone, since a WAF scoring a request on more than its UA reads a
 bare two-header request as automation.
 
+The `User-Agent` itself changes with the circuit. Each attempt takes the next
+entry from a short list of desktop Chrome identities, starting at an offset
+minted per run, so a host that refuses eight circuits in a row is not handed
+the same identity eight times - and two runs do not open with the same one. The
+list is built from a single template over a few platform tokens and major
+versions, because Chrome freezes every other part of its UA string; keeping it
+current is a matter of bumping the version tuple.
+
 ### When there is no answer at all
 
 A link copied out of running text often arrives bare - `tinyurl.com/x`, with no

@@ -106,18 +106,40 @@ SOCKS_SCHEME = "socks5h"
 CIRCUIT_TOKEN = secrets.token_hex(4)
 CIRCUIT_SEP = "-"
 # A plain, current UA: shorteners behind a WAF reject the default one, and an
-# unusual one is a fingerprint.
-USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+# unusual one is a fingerprint. Chrome freezes every part of its UA but the
+# major version, so the whole set is one template over two lists. The template
+# and the macOS platform token were read out of the installed Chrome binary;
+# the Windows and Linux tokens are the two most common desktop Chrome tokens in
+# a real-world observation set. Only CHROME_MAJORS goes stale, and bumping it
+# is a one-line edit.
+UA_TEMPLATE = (
+    "Mozilla/5.0 ({platform}) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
 )
+UA_PLATFORMS = (
+    "Windows NT 10.0; Win64; x64",
+    "Macintosh; Intel Mac OS X 10_15_7",
+    "X11; Linux x86_64",
+)
+CHROME_MAJORS = (149, 150, 151)
+# One identity more than MAX_BLOCKED_ATTEMPTS, so a run that retries all the way
+# to its limit never sends the same UA twice.
+USER_AGENTS = tuple(
+    UA_TEMPLATE.format(platform=platform, major=major)
+    for platform in UA_PLATFORMS
+    for major in CHROME_MAJORS
+)
+USER_AGENT_HEADER = "User-Agent"
+# Where this run starts in that list. Minted per run for the reason CIRCUIT_TOKEN
+# is: a fixed starting point would send every run's first request - the one most
+# hosts ever see - under the same identity.
+UA_OFFSET = secrets.randbelow(len(USER_AGENTS))
 # What a browser sends alongside the UA. A WAF scoring a request on more than
 # its UA reads a bare two-header request as automation; the observed 403s
 # cleared more often with these than without. Not measurable offline, so no
 # test asserts them - they are configuration, and their effect lives on the
 # wire.
-REQUEST_HEADERS = {
-    "User-Agent": USER_AGENT,
+BROWSER_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
     "Upgrade-Insecure-Requests": "1",
@@ -602,6 +624,21 @@ def follow(url, resolve, max_hops=MAX_FOLLOW_HOPS, report=None):
     return url
 
 
+def user_agent(attempt=0):
+    """The UA for one attempt, walking the list from this run's offset.
+
+    An attempt is a fresh circuit; it is now also a fresh identity. A host that
+    scores on the UA used to see the same one on all eight retries, which is the
+    one thing a new exit node could not disguise.
+    """
+    return USER_AGENTS[(UA_OFFSET + attempt) % len(USER_AGENTS)]
+
+
+def request_headers(attempt=0):
+    """The browser header set, wearing this attempt's UA."""
+    return {USER_AGENT_HEADER: user_agent(attempt), **BROWSER_HEADERS}
+
+
 def _proxy_url(socks_port, attempt=0):
     """The SOCKS proxy URL, carrying the credential that picks the circuit.
 
@@ -729,7 +766,7 @@ def tor_resolver(
                 proxy=_proxy_url(socks_port, attempt),
                 timeout=REQUEST_TIMEOUT,
                 follow_redirects=False,
-                headers=REQUEST_HEADERS,
+                headers=request_headers(attempt),
             )
         return clients[attempt]
 
