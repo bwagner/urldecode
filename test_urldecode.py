@@ -12,6 +12,7 @@ from urldecode import (
     BLOCKING_STATUSES,
     DESTINATION_MESSAGE,
     INFERRED_LABEL,
+    MAX_BLOCKED_ATTEMPTS,
     SOCKS_SCHEME,
     TOR_SOCKS_HOST,
     TOR_SOCKS_PORT,
@@ -1026,3 +1027,30 @@ def test_an_ambiguous_page_is_not_announced_as_the_destination():
     assert _forwarding_hop(html, INTERSTITIAL_URL, messages.append) is None
     assert messages == [AMBIGUOUS_MESSAGE]
 
+
+# --- how many circuits to try before giving up -------------------------------
+#
+# Three was a guess made before any of this was measured. Against lnkd.in
+# roughly one request in three gets through, and a run has to win twice - once
+# for the HEAD, once for the body pass - which put the odds of a whole run
+# succeeding near a coin flip. The cap is settable so the next stubborn host
+# does not need a code change.
+
+
+def test_a_cap_of_one_never_retries():
+    tried = []
+    refused = unblocked_response(requester_from([403, 200], tried), attempts=1)
+    assert is_blocked(refused.status_code)
+    assert tried == [0]
+
+
+def test_the_attempt_cap_defaults_to_the_constant():
+    assert _parser().parse_args([]).max_attempts == MAX_BLOCKED_ATTEMPTS
+
+
+def test_the_attempt_cap_can_be_raised_from_the_command_line():
+    assert _parser().parse_args(["-a", "12"]).max_attempts == 12
+
+
+def test_the_attempt_cap_has_a_long_form():
+    assert _parser().parse_args(["--max-attempts", "12"]).max_attempts == 12

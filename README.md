@@ -33,20 +33,26 @@ Requires `uv`. The first run installs `pyperclip` into uv's cache.
 ## Usage
 
 ```
-usage: urldecode.py [-h] [-f] [-T] [-n] [-q] [url]
+usage: urldecode.py [-h] [-f] [-T] [-a N] [-n] [-q] [url]
+
+Find where a link really goes, and strip the tracking on the way.
 
 positional arguments:
   url                   URL to unwrap (default: read the clipboard)
 
 options:
   -h, --help            show this help message and exit
+  -n, --no-copy         do not copy the result to the clipboard
+  -q, --quiet           print only the resulting URL
+
+tor and following:
   -f, --follow          resolve shortener redirects over the network, through
                         tor (see below)
   -T, --no-trust-inferred
                         keep the URL that settled, even when a page names
                         where it forwards (the ?? line)
-  -n, --no-copy         do not copy the result to the clipboard
-  -q, --quiet           print only the resulting URL
+  -a, --max-attempts N  circuits to try while a host refuses the request
+                        (default: 8)
 
 --follow needs tor and never falls back to a direct connection:
 
@@ -272,8 +278,21 @@ exit that just refused it.
 
 Only `403` and `429` count. A `404` is the URL's own answer and a `500` is the
 server failing at it; neither is about this client, and neither would change on
-a new exit. `MAX_BLOCKED_ATTEMPTS` (3) caps the retries, so a hard-blocking
-host costs three requests rather than one.
+a new exit.
+
+`-a/--max-attempts` caps the retries, and the default of 8 is measured rather
+than guessed. Against `lnkd.in` roughly one request in three gets through, and
+a run has to win twice - once for the HEAD, once for the body pass:
+
+| attempts | per stage | whole run |
+| --- | --- | --- |
+| 3 | 73% | 53% |
+| 5 | 88% | 78% |
+| 8 | 97% | 94% |
+
+The first setting shipped was 3, which failed about half of all real runs. The
+extra requests only ever fall on a host that is already refusing them, and the
+flag is there so the next stubborn host does not need a code change.
 
 A HEAD refused on every circuit then gets asked again with a GET, the same
 streamed-GET path a host refusing the method outright (`405`, `501`) already

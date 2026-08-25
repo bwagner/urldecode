@@ -79,7 +79,12 @@ METHOD_NOT_ALLOWED = (405, 501)
 # 404 is the URL's own answer and a 500 is the server failing at it; neither is
 # about us, and neither would change on a new exit.
 BLOCKING_STATUSES = (403, 429)
-MAX_BLOCKED_ATTEMPTS = 3
+# Measured against lnkd.in, on fresh circuits: roughly one request in three
+# gets through, and a run has to win twice - once for the HEAD, once for the
+# body pass. At three attempts that is near a coin flip for the whole run; at
+# eight it is about nineteen runs in twenty. The extra requests only ever fall
+# on a host that is already refusing them.
+MAX_BLOCKED_ATTEMPTS = 8
 RETRY_MESSAGE = "  .. refused, retrying on a new circuit"
 GET_FALLBACK_MESSAGE = "  .. HEAD did not answer, asking with GET"
 BLOCKED_MESSAGE = "  .. refused on every circuit tried"
@@ -622,7 +627,7 @@ def _hop(response, report):
     return location
 
 
-def _open_get(stack, client_for, url, report):
+def _open_get(stack, client_for, url, report, attempts=MAX_BLOCKED_ATTEMPTS):
     """A GET stream, retried on a fresh circuit while the host refuses.
 
     The stack owns every attempt, refused ones included, so nothing is left
@@ -630,11 +635,12 @@ def _open_get(stack, client_for, url, report):
     """
     return unblocked_response(
         lambda attempt: stack.enter_context(client_for(attempt).stream("GET", url)),
+        attempts=attempts,
         report=report,
     )
 
 
-def _read_forward(client_for, url, report, note=None, blocked=None):
+def _read_forward(client_for, url, report, note=None, blocked=None, attempts=MAX_BLOCKED_ATTEMPTS):
     """Open a capped prefix of a page and see whether it forwards on.
 
     The status is read before the body is: a refusal serves a short HTML page
@@ -642,13 +648,13 @@ def _read_forward(client_for, url, report, note=None, blocked=None):
     destination.
     """
     with ExitStack() as stack:
-        streamed = _open_get(stack, client_for, url, report)
+        streamed = _open_get(stack, client_for, url, report, attempts)
         if _refused(streamed, report, blocked):
             return None
         return _forwarding_hop(bounded_text(streamed.iter_bytes()), url, report, note)
 
 
-def tor_resolver(socks_port, report, note=None, blocked=None):
+def tor_resolver(socks_port, report, note=None, blocked=None, attempts=MAX_BLOCKED_ATTEMPTS):
     """Return (resolve, close): resolve(url) reads one hop through tor.
 
     Headers alone answer the question for a redirect. A page that settles is
@@ -673,7 +679,7 @@ def tor_resolver(socks_port, report, note=None, blocked=None):
 
     def resolve(url):
         response = unblocked_response(
-            lambda attempt: client_for(attempt).head(url), report=report
+            lambda attempt: client_for(attempt).head(url), attempts=attempts, report=report
         )
         if needs_get(response.status_code):
             # Nothing was learned from the HEAD, whether the method was refused
@@ -681,7 +687,7 @@ def tor_resolver(socks_port, report, note=None, blocked=None):
             # the body pass below asks for.
             report(GET_FALLBACK_MESSAGE)
             with ExitStack() as stack:
-                streamed = _open_get(stack, client_for, url, report)
+                streamed = _open_get(stack, client_for, url, report, attempts)
                 if _refused(streamed, report, blocked):
                     return None
                 location = _hop(streamed, report)
@@ -695,7 +701,7 @@ def tor_resolver(socks_port, report, note=None, blocked=None):
             return location
         if not worth_reading(response):
             return None
-        return _read_forward(client_for, url, report, note, blocked)
+        return _read_forward(client_for, url, report, note, blocked, attempts)
 
     def close():
         for client in clients.values():
@@ -776,13 +782,13 @@ def tor_socks_port(report):
     return TOR_LAUNCH_PORT, start_tor(report)
 
 
-def resolve_through_tor(url, report, note=None, blocked=None):
+def resolve_through_tor(url, report, note=None, blocked=None, attempts=MAX_BLOCKED_ATTEMPTS):
     """Follow url to its destination over tor, cleaning it at every hop."""
     port, started = tor_socks_port(report)
     close = None
     try:
         confirm_tor(port, started is not None, report)
-        resolve, close = tor_resolver(port, report, note, blocked)
+        resolve, close = tor_resolver(port, report, note, blocked, attempts)
 
         def reporting_resolve(target):
             location = resolve(target)
@@ -821,6 +827,14 @@ def chosen_result(settled, inferred, trust, blocked=False):
     return settled, UNWRAPPED_LABEL
 
 
+def _at_least_one(text):
+    """An attempt count argparse will reject rather than let reach the loop."""
+    count = int(text)
+    if count < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return count
+
+
 def _parser():
     """The CLI, built apart from main() so its defaults can be read in a test."""
     parser = argparse.ArgumentParser(
@@ -829,18 +843,27 @@ def _parser():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("url", nargs="?", help="URL to unwrap (default: read the clipboard)")
-    parser.add_argument(
+    following = parser.add_argument_group("tor and following")
+    following.add_argument(
         "-f",
         "--follow",
         action="store_true",
         help="resolve shortener redirects over the network, through tor (see below)",
     )
-    parser.add_argument(
+    following.add_argument(
         "-T",
         "--no-trust-inferred",
         dest="trust_inferred",
         action="store_false",
         help="keep the URL that settled, even when a page names where it forwards (the ?? line)",
+    )
+    following.add_argument(
+        "-a",
+        "--max-attempts",
+        type=_at_least_one,
+        default=MAX_BLOCKED_ATTEMPTS,
+        metavar="N",
+        help=f"circuits to try while a host refuses the request (default: {MAX_BLOCKED_ATTEMPTS})",
     )
     parser.add_argument("-n", "--no-copy", action="store_true", help="do not copy the result to the clipboard")
     parser.add_argument("-q", "--quiet", action="store_true", help="print only the resulting URL")
@@ -886,7 +909,7 @@ def main(argv=None):
         # Before tor is even started: this, not the line above, is what will go
         # over the wire.
         report(f"  => {cleaned}")
-        settled = resolve_through_tor(url, report, note, blocked)
+        settled = resolve_through_tor(url, report, note, blocked, args.max_attempts)
     else:
         settled = cleaned
 
