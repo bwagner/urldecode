@@ -158,7 +158,8 @@ that no exact-name list would have known about, and none of them survived.
 
 Each hop is a HEAD request (falling back to a streamed GET where HEAD is
 refused), following `Location`, bounded by `MAX_FOLLOW_HOPS` and stopping early
-on a redirect cycle. **Tracking is stripped before every request**, so the
+on a redirect cycle, and retried on a fresh circuit when the host refuses it
+(see below). **Tracking is stripped before every request**, so the
 shortener is never handed the `fbclid` that led you to it, and the text-level
 unwrap runs again after each hop, since hops routinely land on URLs carrying
 fresh `utm_*` junk.
@@ -222,6 +223,52 @@ rather than written in the markup, is out of scope. Reading it properly needs a
 browser engine, which would end the single-file script, and pattern-matching
 script text works on the easy cases and fails silently on the rest.
 
+### When the host refuses (`403`, `429`)
+
+Some hosts serve a `403` to tor exits - `lnkd.in` does it intermittently, and
+the same request through a different exit node succeeds. That is a refusal
+aimed at the exit node, not a fact about the URL, so it is retried rather than
+reported as where the link ends:
+
+```console
+$ urldecode.py --follow 'https://lnkd.in/exampleId'
+from command line: https://lnkd.in/exampleId
+  => https://lnkd.in/exampleId
+tor: using what is already on 127.0.0.1:9050
+tor: exit node 193.189.100.204
+  .. refused, retrying on a new circuit
+  .. refused, retrying on a new circuit
+  .. refused on every circuit tried
+blocked:
+https://lnkd.in/exampleId
+```
+
+`blocked:` is a third label beside `unwrapped:` and `inferred:`, and it is the
+point of the exercise: the URL below it is only as far as this got, not a
+destination. Without it a refusal reads exactly like an arrival.
+
+The new circuit comes from the SOCKS credential, not from a control port. tor
+gives a distinct circuit per distinct username/password pair
+(`IsolateSOCKSAuth`, on by default), so attempt *n* simply proxies through
+`socks5h://<token>-n:<token>-n@127.0.0.1:9050`. The token is minted once per
+run, because tor keeps an isolated circuit alive for `MaxCircuitDirtiness`
+(10 minutes) and a fixed credential would land a re-run straight back on the
+exit that just refused it.
+
+Only `403` and `429` count. A `404` is the URL's own answer and a `500` is the
+server failing at it; neither is about this client, and neither would change on
+a new exit. `MAX_BLOCKED_ATTEMPTS` (3) caps the retries, so a hard-blocking
+host costs three requests rather than one.
+
+The body pass is retried the same way, and its status is checked before its
+bytes are read - a refusal serves a short HTML page of its own, which forwards
+nowhere and would otherwise be announced as the destination.
+
+Requests also carry the header set a browser sends (`Accept`,
+`Accept-Language`, `Upgrade-Insecure-Requests`, `Sec-Fetch-*`) rather than a
+`User-Agent` alone, since a WAF scoring a request on more than its UA reads a
+bare two-header request as automation.
+
 ### tor
 
 `--follow` needs tor and will not fall back to a direct connection. Three cases:
@@ -243,7 +290,8 @@ script text works on the easy cases and fails silently on the rest.
    the difference between `brew services run` and `start`).
 
 Requests are proxied with `socks5h://`, so DNS is resolved by the exit node
-rather than locally.
+rather than locally, and carry a per-run SOCKS credential so that each retry
+gets its own circuit.
 
 ### What this does and does not hide
 

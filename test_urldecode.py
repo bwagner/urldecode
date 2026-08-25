@@ -7,9 +7,14 @@ from types import SimpleNamespace
 import pytest
 
 from urldecode import (
+    BLOCKED_LABEL,
     INFERRED_LABEL,
+    SOCKS_SCHEME,
+    TOR_SOCKS_HOST,
+    TOR_SOCKS_PORT,
     UNWRAPPED_LABEL,
     TorCheckFailed,
+    _proxy_url,
     _forwarding_hop,
     _parser,
     _hop,
@@ -18,12 +23,14 @@ from urldecode import (
     confirm_tor,
     follow,
     forwarding_target,
+    is_blocked,
     meta_refresh_target,
     og_title,
     sole_offsite_anchor,
     worth_reading,
     socks_port_open,
     strip_tracking,
+    unblocked_response,
     unredirect,
     unwrap,
 )
@@ -710,3 +717,135 @@ def test_an_inferred_candidate_is_taken_unless_it_is_refused():
     # names where it forwards is answering the question the tool was asked.
     assert _parser().parse_args([]).trust_inferred is True
     assert _parser().parse_args(["--no-trust-inferred"]).trust_inferred is False
+
+
+# --- a refusal is not an answer ----------------------------------------------
+#
+# LinkedIn's edge returns 403 to a tor exit intermittently: the same request
+# through a fresh circuit succeeds, and the plain 403 page it serves parses as
+# HTML that forwards nowhere. Left alone, a refusal aimed at the exit node is
+# reported as a fact about the URL. It is retried instead.
+#
+# Every test here is offline: the retry takes its request as a parameter, the
+# way follow() takes its resolver.
+
+
+@pytest.mark.parametrize("status", [403, 429])
+def test_a_refusal_is_recognised_as_a_block(status):
+    assert is_blocked(status)
+
+
+@pytest.mark.parametrize("status", [200, 301, 404, 500])
+def test_an_ordinary_answer_is_not_a_block(status):
+    # A 404 is the URL's own answer and a 500 is the server failing at it;
+    # neither is aimed at this client, so neither is worth a new circuit.
+    assert not is_blocked(status)
+
+
+def requester_from(statuses, tried=None):
+    """Build a request(attempt) over canned statuses, recording its calls."""
+
+    def request(attempt):
+        if tried is not None:
+            tried.append(attempt)
+        return response(statuses[attempt])
+
+    return request
+
+
+def test_a_response_that_is_not_refused_is_returned_at_once():
+    tried = []
+    assert unblocked_response(requester_from([200], tried)).status_code == 200
+    assert tried == [0]
+
+
+def test_a_refusal_is_retried_and_the_answer_that_follows_is_kept():
+    tried = []
+    assert unblocked_response(requester_from([403, 200], tried)).status_code == 200
+    assert tried == [0, 1]
+
+
+def test_every_attempt_asks_for_a_circuit_of_its_own():
+    tried = []
+    unblocked_response(requester_from([403, 403, 200], tried))
+    assert len(set(tried)) == len(tried)
+
+
+def test_retrying_stops_at_the_cap_and_yields_the_last_refusal():
+    tried = []
+    refused = unblocked_response(requester_from([403] * 5, tried), attempts=3)
+    assert is_blocked(refused.status_code)
+    assert tried == [0, 1, 2]
+
+
+def test_every_retry_is_reported():
+    messages = []
+    unblocked_response(requester_from([403, 403, 200]), report=messages.append)
+    assert len(messages) == 2
+
+
+def test_a_run_that_was_never_refused_reports_nothing():
+    messages = []
+    unblocked_response(requester_from([200]), report=messages.append)
+    assert messages == []
+
+
+def test_reporting_is_optional():
+    assert unblocked_response(requester_from([403, 200])).status_code == 200
+
+
+# --- a new circuit for every attempt -----------------------------------------
+#
+# tor gives a distinct circuit per distinct SOCKS username/password pair
+# (IsolateSOCKSAuth, on by default), so a retry needs no control port and no
+# NEWNYM: a new credential in the proxy URL is a new exit node.
+
+
+def test_the_proxy_url_still_points_at_the_local_tor_port():
+    parts = ul.urlsplit(_proxy_url(TOR_SOCKS_PORT))
+    assert parts.scheme == SOCKS_SCHEME
+    assert parts.hostname == TOR_SOCKS_HOST
+    assert parts.port == TOR_SOCKS_PORT
+
+
+def test_each_attempt_gets_a_credential_of_its_own():
+    first = ul.urlsplit(_proxy_url(TOR_SOCKS_PORT, 0))
+    second = ul.urlsplit(_proxy_url(TOR_SOCKS_PORT, 1))
+    assert (first.username, first.password) != (second.username, second.password)
+
+
+def test_the_same_attempt_stays_on_the_same_circuit():
+    assert _proxy_url(TOR_SOCKS_PORT, 1) == _proxy_url(TOR_SOCKS_PORT, 1)
+
+
+def test_the_credential_survives_the_round_trip_through_the_url():
+    # A credential carrying ":" or "@" would silently reshape the proxy URL and
+    # send the requests somewhere else entirely.
+    parts = ul.urlsplit(_proxy_url(TOR_SOCKS_PORT, 2))
+    assert parts.username
+    assert parts.hostname == TOR_SOCKS_HOST
+    assert parts.port == TOR_SOCKS_PORT
+
+
+# --- a refused chain is not a destination ------------------------------------
+
+
+def test_a_refused_chain_is_labelled_as_blocked():
+    _, label = chosen_result("https://short.example/x", None, True, blocked=True)
+    assert label == BLOCKED_LABEL
+
+
+def test_a_refused_chain_still_yields_the_url_it_reached():
+    result, _ = chosen_result("https://short.example/x", None, True, blocked=True)
+    assert result == "https://short.example/x"
+
+
+def test_a_chain_that_was_not_refused_keeps_the_ordinary_label():
+    _, label = chosen_result("https://example.com/a", None, True, blocked=False)
+    assert label == UNWRAPPED_LABEL
+
+
+def test_a_candidate_read_off_a_page_outranks_a_late_refusal():
+    result, label = chosen_result("https://short.example/x", "https://example.com/real", True, blocked=True)
+    assert (result, label) == ("https://example.com/real", INFERRED_LABEL)
+

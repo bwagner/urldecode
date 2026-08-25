@@ -5,11 +5,13 @@
 """Find where a link really goes, and strip the tracking on the way."""
 
 import argparse
+import secrets
 import shutil
 import socket
 import sys
 import tempfile
 import urllib.parse as ul
+from contextlib import ExitStack
 from html.parser import HTMLParser
 from typing import NamedTuple, Optional
 
@@ -71,18 +73,50 @@ REQUEST_TIMEOUT = 30
 MAX_FOLLOW_HOPS = 10
 REDIRECT_STATUSES = range(300, 400)
 METHOD_NOT_ALLOWED = (405, 501)
+# A refusal aimed at the client, not an answer about the URL. lnkd.in serves
+# these to tor exits intermittently - the same request through a fresh circuit
+# succeeds - so they are retried rather than reported as where a link ends. A
+# 404 is the URL's own answer and a 500 is the server failing at it; neither is
+# about us, and neither would change on a new exit.
+BLOCKING_STATUSES = (403, 429)
+MAX_BLOCKED_ATTEMPTS = 3
+RETRY_MESSAGE = "  .. refused, retrying on a new circuit"
+BLOCKED_MESSAGE = "  .. refused on every circuit tried"
 LOCATION_HEADER = "location"
 CONTENT_TYPE_HEADER = "content-type"
 CONTENT_TYPE_SEP = ";"
 UNKNOWN_CONTENT_TYPE = "unknown type"
 # curl's --socks5-hostname equivalent: DNS is resolved by the exit node, not here.
 SOCKS_SCHEME = "socks5h"
+# tor gives a distinct circuit per distinct SOCKS username/password pair
+# (IsolateSOCKSAuth, on by default), so a retry needs no control port and no
+# NEWNYM: a new credential is a new exit node. The token is minted per run
+# because tor keeps an isolated circuit alive for MaxCircuitDirtiness (10
+# minutes), and a fixed credential would land a re-run back on the exit that
+# just refused. Hex, so nothing in it can reshape the proxy URL.
+CIRCUIT_TOKEN = secrets.token_hex(4)
+CIRCUIT_SEP = "-"
 # A plain, current UA: shorteners behind a WAF reject the default one, and an
 # unusual one is a fingerprint.
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
 )
+# What a browser sends alongside the UA. A WAF scoring a request on more than
+# its UA reads a bare two-header request as automation; the observed 403s
+# cleared more often with these than without. Not measurable offline, so no
+# test asserts them - they are configuration, and their effect lives on the
+# wire.
+REQUEST_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+}
 
 FOLLOW_EPILOG = """\
 --follow needs tor and never falls back to a direct connection:
@@ -226,6 +260,9 @@ DESTINATION_MESSAGE = "  .. no forward in the page: this is the destination"
 # that a glance at the trace says which one reached stdout and the clipboard.
 UNWRAPPED_LABEL = "unwrapped:"
 INFERRED_LABEL = "inferred:"
+# Not an answer at all: the host refused every circuit, so the URL below is
+# only as far as this got.
+BLOCKED_LABEL = "blocked:"
 
 
 class Forward(NamedTuple):
@@ -431,8 +468,50 @@ def follow(url, resolve, max_hops=MAX_FOLLOW_HOPS, report=None):
     return url
 
 
-def _proxy_url(socks_port):
-    return f"{SOCKS_SCHEME}://{TOR_SOCKS_HOST}:{socks_port}"
+def _proxy_url(socks_port, attempt=0):
+    """The SOCKS proxy URL, carrying the credential that picks the circuit.
+
+    Attempts differ only in that credential, which is all tor needs to route
+    them through different exit nodes.
+    """
+    credential = f"{CIRCUIT_TOKEN}{CIRCUIT_SEP}{attempt}"
+    return f"{SOCKS_SCHEME}://{credential}:{credential}@{TOR_SOCKS_HOST}:{socks_port}"
+
+
+def is_blocked(status):
+    """True when a status refused this client rather than answering about the URL."""
+    return status in BLOCKING_STATUSES
+
+
+def unblocked_response(request, attempts=MAX_BLOCKED_ATTEMPTS, report=None):
+    """Return the first response that was not a refusal, or the last refusal.
+
+    `request(attempt)` makes one request; a different attempt number means a
+    different circuit, which is the whole point - a refusal is usually aimed at
+    the exit node, not at us. Taking the request as a parameter is what keeps
+    this testable without a network, the way follow() takes its resolver.
+    """
+    for attempt in range(attempts):
+        response = request(attempt)
+        if not is_blocked(response.status_code) or attempt == attempts - 1:
+            return response
+        if report is not None:
+            report(RETRY_MESSAGE)
+
+
+def _refused(response, report, blocked):
+    """True when every circuit was refused; says so once, and remembers it.
+
+    A refusal is not a destination, so the caller stops without pretending the
+    chain arrived anywhere, and `blocked` carries that fact past follow() to
+    the one place that labels the result.
+    """
+    if not is_blocked(response.status_code):
+        return False
+    report(BLOCKED_MESSAGE)
+    if blocked is not None:
+        blocked()
+    return True
 
 
 def _hop(response, report):
@@ -453,35 +532,68 @@ def _hop(response, report):
     return location
 
 
-def _read_forward(client, url, report, note=None):
-    """Open a capped prefix of a page and see whether it forwards on."""
-    with client.stream("GET", url) as streamed:
-        html = bounded_text(streamed.iter_bytes())
-    return _forwarding_hop(html, url, report, note)
+def _open_get(stack, client_for, url, report):
+    """A GET stream, retried on a fresh circuit while the host refuses.
+
+    The stack owns every attempt, refused ones included, so nothing is left
+    open when the caller is done reading.
+    """
+    return unblocked_response(
+        lambda attempt: stack.enter_context(client_for(attempt).stream("GET", url)),
+        report=report,
+    )
 
 
-def tor_resolver(socks_port, report, note=None):
-    """Return a resolve(url) that reads one hop through tor.
+def _read_forward(client_for, url, report, note=None, blocked=None):
+    """Open a capped prefix of a page and see whether it forwards on.
+
+    The status is read before the body is: a refusal serves a short HTML page
+    of its own, which forwards nowhere and would otherwise be announced as the
+    destination.
+    """
+    with ExitStack() as stack:
+        streamed = _open_get(stack, client_for, url, report)
+        if _refused(streamed, report, blocked):
+            return None
+        return _forwarding_hop(bounded_text(streamed.iter_bytes()), url, report, note)
+
+
+def tor_resolver(socks_port, report, note=None, blocked=None):
+    """Return (resolve, close): resolve(url) reads one hop through tor.
 
     Headers alone answer the question for a redirect. A page that settles is
     opened only when it is a 200 that says it is HTML, and then only far enough
-    to see whether it forwards on.
+    to see whether it forwards on. Either request is retried on a new circuit
+    while the host refuses it, and the caller closes what was opened.
     """
     import httpx
 
-    client = httpx.Client(
-        proxy=_proxy_url(socks_port),
-        timeout=REQUEST_TIMEOUT,
-        follow_redirects=False,
-        headers={"User-Agent": USER_AGENT},
-    )
+    clients = {}
+
+    def client_for(attempt):
+        """One client per circuit, so hops on the same attempt keep their connection."""
+        if attempt not in clients:
+            clients[attempt] = httpx.Client(
+                proxy=_proxy_url(socks_port, attempt),
+                timeout=REQUEST_TIMEOUT,
+                follow_redirects=False,
+                headers=REQUEST_HEADERS,
+            )
+        return clients[attempt]
 
     def resolve(url):
-        response = client.head(url)
+        response = unblocked_response(
+            lambda attempt: client_for(attempt).head(url), report=report
+        )
+        if _refused(response, report, blocked):
+            return None
         if response.status_code in METHOD_NOT_ALLOWED:
             # Some hosts refuse HEAD. Stream the GET so nothing is read beyond
             # what the body pass below asks for.
-            with client.stream("GET", url) as streamed:
+            with ExitStack() as stack:
+                streamed = _open_get(stack, client_for, url, report)
+                if _refused(streamed, report, blocked):
+                    return None
                 location = _hop(streamed, report)
                 if location is not None:
                     return location
@@ -491,9 +603,15 @@ def tor_resolver(socks_port, report, note=None):
         location = _hop(response, report)
         if location is not None:
             return location
-        return _read_forward(client, url, report, note) if worth_reading(response) else None
+        if not worth_reading(response):
+            return None
+        return _read_forward(client_for, url, report, note, blocked)
 
-    return resolve
+    def close():
+        for client in clients.values():
+            client.close()
+
+    return resolve, close
 
 
 class TorCheckFailed(Exception):
@@ -568,12 +686,13 @@ def tor_socks_port(report):
     return TOR_LAUNCH_PORT, start_tor(report)
 
 
-def resolve_through_tor(url, report, note=None):
+def resolve_through_tor(url, report, note=None, blocked=None):
     """Follow url to its destination over tor, cleaning it at every hop."""
     port, started = tor_socks_port(report)
+    close = None
     try:
         confirm_tor(port, started is not None, report)
-        resolve = tor_resolver(port, report, note)
+        resolve, close = tor_resolver(port, report, note, blocked)
 
         def reporting_resolve(target):
             location = resolve(target)
@@ -588,19 +707,27 @@ def resolve_through_tor(url, report, note=None):
 
         return follow(url, reporting_resolve, report=report)
     finally:
+        if close is not None:
+            close()
         if started is not None:
             started.kill()
 
 
-def chosen_result(settled, inferred, trust):
+def chosen_result(settled, inferred, trust, blocked=False):
     """Return the URL to print, and the label that says what kind it is.
 
     A candidate read off a page's shape is the answer when there is one, since
     it is the answer the user came for - but never silently: it is labelled for
     what it is, and --no-trust-inferred keeps the URL that actually settled.
+
+    A chain that was refused on every circuit has no answer at all. The URL it
+    reached is still printed, being the best that is known, but under a label
+    that does not call it a destination.
     """
     if trust and inferred is not None:
         return inferred, INFERRED_LABEL
+    if blocked:
+        return settled, BLOCKED_LABEL
     return settled, UNWRAPPED_LABEL
 
 
@@ -652,22 +779,28 @@ def main(argv=None):
         report(f"  -> {target}")
 
     inferred = None
+    refused = False
 
     def note(candidate):
         """Remember a forward this tool read off a page but did not follow."""
         nonlocal inferred
         inferred = candidate
 
+    def blocked():
+        """Remember that the chain ended on a refusal, not on a destination."""
+        nonlocal refused
+        refused = True
+
     cleaned = unwrap(url)
     if args.follow:
         # Before tor is even started: this, not the line above, is what will go
         # over the wire.
         report(f"  => {cleaned}")
-        settled = resolve_through_tor(url, report, note)
+        settled = resolve_through_tor(url, report, note, blocked)
     else:
         settled = cleaned
 
-    result, label = chosen_result(settled, inferred, args.trust_inferred)
+    result, label = chosen_result(settled, inferred, args.trust_inferred, refused)
     report(label)
     print(result)
 
