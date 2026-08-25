@@ -20,6 +20,7 @@ from urldecode import (
     TOR_SOCKS_HOST,
     TOR_SOCKS_PORT,
     UNCORROBORATED_MESSAGE,
+    UNREAD_MESSAGE,
     UNWRAPPED_LABEL,
     TorCheckFailed,
     _proxy_url,
@@ -38,6 +39,7 @@ from urldecode import (
     no_forward_message,
     offsite_targets,
     og_title,
+    same_host,
     sole_offsite_anchor,
     worth_reading,
     socks_port_open,
@@ -545,6 +547,60 @@ def test_an_error_page_is_not_read():
 
 def test_a_response_without_a_content_type_is_not_read():
     assert worth_reading(response(200)) is False
+
+
+# --- only a page on the host we asked about can still be a forwarder ---------
+#
+# A page reached by following a Location is where the previous host said to go:
+# reading it asks a destination whether it forwards on, which costs a request
+# and up to MAX_BODY_BYTES to learn nothing. A page served by the host we asked
+# about is the other case - nobody has told us where it goes, and the markup is
+# the only thing that can.
+
+
+def test_a_page_on_the_host_asked_is_still_a_candidate():
+    # ebx.sh answers 200 text/html for the very URL handed in; the anchor in
+    # that page is the only forward there is.
+    assert same_host("https://ebx.sh/kfCXO9", "https://ebx.sh/kfCXO9") is True
+
+
+def test_a_redirect_that_left_the_host_asked_has_arrived():
+    # tinyurl said where it goes. Reading instagram.com only confirms that a
+    # destination is a destination.
+    assert same_host("https://www.instagram.com/p/abc/", "https://tinyurl.com/2p9dxbcy") is False
+
+
+def test_a_same_host_redirect_is_still_a_candidate():
+    # A shortener may bounce through its own interstitial before serving it.
+    assert same_host("https://lnkd.in/interstitial?u=x", "https://lnkd.in/edx9SEqJ") is True
+
+
+def test_the_host_comparison_ignores_case():
+    assert same_host("https://EBX.SH/x", "https://ebx.sh/y") is True
+
+
+def test_the_host_comparison_ignores_the_port():
+    assert same_host("https://example.com:8443/x", "https://example.com/y") is True
+
+
+def test_the_host_comparison_ignores_the_scheme():
+    # An http -> https upgrade is not an arrival.
+    assert same_host("http://example.com/x", "https://example.com/x") is True
+
+
+def test_a_subdomain_is_not_the_host_asked():
+    # Deliberately strict: no www-folding, no registrable-domain rule. A
+    # shortener that redirects to its own www host loses its body pass, which
+    # costs an inference; guessing which subdomains are "the same site" costs
+    # correctness.
+    assert same_host("https://www.example.com/x", "https://example.com/y") is False
+
+
+def test_a_page_that_was_not_read_is_not_called_a_destination():
+    # DESTINATION_MESSAGE is what a page that was actually parsed earns. Here
+    # nothing looked, so the trace may not claim the same fact.
+    assert UNREAD_MESSAGE != DESTINATION_MESSAGE
+    assert UNREAD_MESSAGE not in (AMBIGUOUS_MESSAGE, UNCORROBORATED_MESSAGE)
 
 
 # --- reading a bounded prefix of a body --------------------------------------

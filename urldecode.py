@@ -265,6 +265,10 @@ DESTINATION_MESSAGE = "  .. no forward in the page: this is the destination"
 # forwards nowhere, and the line above used to claim it was.
 AMBIGUOUS_MESSAGE = "  .. the page links off-site more than once and names no destination"
 UNCORROBORATED_MESSAGE = "  .. one off-site link, but nothing on the page corroborates it"
+# Not a finding about the page - a decision not to open it. The three lines
+# above are earned by parsing; this one says only that nothing looked, so it
+# must not borrow their "this is the destination".
+UNREAD_MESSAGE = "  .. off the host asked, page not read"
 # The two kinds of answer this tool can end on: one read out of a wrapper or
 # confirmed by a server, one read off a page's shape. They print differently so
 # that a glance at the trace says which one reached stdout and the clipboard.
@@ -473,6 +477,17 @@ def worth_reading(response):
     return content_type.split(CONTENT_TYPE_SEP)[0].strip().lower() == HTML_CONTENT_TYPE
 
 
+def same_host(url, other):
+    """True when two URLs are served by the same host.
+
+    Scheme, port and case are not the host: an http -> https upgrade is not an
+    arrival somewhere new. Subdomains are, deliberately - folding `www.` in
+    would mean deciding which subdomains count as one site, which needs a
+    public-suffix rule rather than a guess.
+    """
+    return ul.urlsplit(url).hostname == ul.urlsplit(other).hostname
+
+
 def bounded_text(chunks, limit=MAX_BODY_BYTES):
     """Decode at most `limit` bytes of a streamed body.
 
@@ -654,13 +669,16 @@ def _read_forward(client_for, url, report, note=None, blocked=None, attempts=MAX
         return _forwarding_hop(bounded_text(streamed.iter_bytes()), url, report, note)
 
 
-def tor_resolver(socks_port, report, note=None, blocked=None, attempts=MAX_BLOCKED_ATTEMPTS):
+def tor_resolver(socks_port, report, origin, note=None, blocked=None, attempts=MAX_BLOCKED_ATTEMPTS):
     """Return (resolve, close): resolve(url) reads one hop through tor.
 
     Headers alone answer the question for a redirect. A page that settles is
-    opened only when it is a 200 that says it is HTML, and then only far enough
-    to see whether it forwards on. Either request is retried on a new circuit
-    while the host refuses it, and the caller closes what was opened.
+    opened only when it is a 200 that says it is HTML, on the host `origin`
+    named, and then only far enough to see whether it forwards on. Anywhere
+    else is where a server said to go, and asking a destination whether it
+    forwards on costs a request and a body to learn nothing. Either request is
+    retried on a new circuit while the host refuses it, and the caller closes
+    what was opened.
     """
     import httpx
 
@@ -695,11 +713,17 @@ def tor_resolver(socks_port, report, note=None, blocked=None, attempts=MAX_BLOCK
                     return location
                 if not worth_reading(streamed):
                     return None
+                if not same_host(url, origin):
+                    report(UNREAD_MESSAGE)
+                    return None
                 return _forwarding_hop(bounded_text(streamed.iter_bytes()), url, report, note)
         location = _hop(response, report)
         if location is not None:
             return location
         if not worth_reading(response):
+            return None
+        if not same_host(url, origin):
+            report(UNREAD_MESSAGE)
             return None
         return _read_forward(client_for, url, report, note, blocked, attempts)
 
@@ -788,7 +812,10 @@ def resolve_through_tor(url, report, note=None, blocked=None, attempts=MAX_BLOCK
     close = None
     try:
         confirm_tor(port, started is not None, report)
-        resolve, close = tor_resolver(port, report, note, blocked, attempts)
+        # follow() unwraps before its first request, so the host this chain is
+        # really about is the unwrapped one - not l.facebook.com, but whatever
+        # the wrapper was carrying.
+        resolve, close = tor_resolver(port, report, unwrap(url), note, blocked, attempts)
 
         def reporting_resolve(target):
             location = resolve(target)

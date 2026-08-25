@@ -177,10 +177,32 @@ often showing an ad or a countdown while it does. There is no redirect header
 for that, so the chain settles at the shortener while the real destination sits
 in the HTML.
 
-When a hop settles on a `200` that says it is `text/html`, and only then, up to
-`MAX_BODY_BYTES` (64KB) of the page is read. It is parsed as markup, never
-executed, and nothing it references is fetched. What happens next depends on how
-the page says where it goes.
+When a hop settles on a `200` that says it is `text/html`, **and that page is
+served by the host the chain was about**, and only then, up to `MAX_BODY_BYTES`
+(64KB) of the page is read. It is parsed as markup, never executed, and nothing
+it references is fetched. What happens next depends on how the page says where
+it goes.
+
+The host condition is what keeps the body pass off destinations. A page reached
+by following a `Location` is where the previous host said to go, so reading it
+asks a destination whether it forwards on - a request and up to 64KB to learn
+nothing. A page served by the host that was asked is the other case: nothing has
+said where it goes, and the markup is the only thing that can. So
+`tinyurl.com/...` redirecting to a photo on another site is never opened, while
+a shortener that answers `200` with its own interstitial still is:
+
+```console
+  .. 200 text/html, no redirect
+  .. off the host asked, page not read
+```
+
+That line reports a decision, not a finding. It does not say the page is the
+destination, because nothing looked. Scheme, port and case are not part of the
+host, so an `http` -> `https` upgrade still counts as the same one; a different
+subdomain does not, which is deliberate - folding `www.` in would mean deciding
+which subdomains are one site, and that needs a public-suffix rule rather than a
+guess. The cost of the rule is a chain of two shorteners where the second serves
+an HTML forwarder: that page is no longer read.
 
 **It declares a `<meta http-equiv="refresh">`.** The page states its own
 destination, so it is followed like any `Location` and printed as the usual
