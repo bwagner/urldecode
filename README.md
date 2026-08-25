@@ -147,7 +147,7 @@ tor: exit node 185.220.101.19
   -> https://www.example.com/feuilleton/some-article-ld.123?utm_campaign=mrf-facebook-x&utm_source=facebook&utm_medium=social&mrfcid=20260101ExampleMrfClickId
   => https://www.example.com/feuilleton/some-article-ld.123
   .. 200 text/html, no redirect
-  .. no forward in the page: this is the destination
+  .. off the host asked, page not read
 unwrapped:
 https://www.example.com/feuilleton/some-article-ld.123
 ```
@@ -157,10 +157,14 @@ came back, `=>` is the same URL cleaned, and the `=>` is what gets requested
 next. A final `..` line reports the status and content type of the URL that did
 not redirect, so the chain ends by saying why it ended rather than just
 stopping - a `404` or an unexpected content type shows up instead of being
-silently presented as the destination. The first pair is printed before tor is even started, so you can see what
-will go over the wire before anything does. The wrapper handed over an
-`fbclid`, the shortener handed back four more parameters including the `mrfcid`
-that no exact-name list would have known about, and none of them survived.
+silently presented as the destination. The second `..` line here is the body
+pass declining to open a page served by a host the chain never asked about,
+which is described under [When there is no `Location` to
+follow](#when-there-is-no-location-to-follow). The first pair is printed before
+tor is even started, so you can see what will go over the wire before anything
+does. The wrapper handed over an `fbclid`, the shortener handed back four more
+parameters including the `mrfcid` that no exact-name list would have known
+about, and none of them survived.
 
 Each hop is a HEAD request (falling back to a streamed GET where HEAD is
 refused), following `Location`, bounded by `MAX_FOLLOW_HOPS` and stopping early
