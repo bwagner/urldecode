@@ -306,6 +306,13 @@ DESTINATION_MESSAGE = "  .. no forward in the page: this is the destination"
 # forwards nowhere, and the line above used to claim it was.
 AMBIGUOUS_MESSAGE = "  .. the page links off-site more than once and names no destination"
 UNCORROBORATED_MESSAGE = "  .. one off-site link, but nothing on the page corroborates it"
+# A page carrying no links at all is not a page that forwards nowhere; it is a
+# page with nothing in it to read. A forwarder that works from its script
+# renders as an empty shell, and executing that script is out of scope - so this
+# reports what was seen and stops short of the claim above it.
+NO_LINKS_MESSAGE = (
+    "  .. no links at all in the page: if it forwards, it does so from its script"
+)
 # Not a finding about the page - a decision not to open it. The three lines
 # above are earned by parsing; this one says only that nothing looked, so it
 # must not borrow their "this is the destination".
@@ -502,14 +509,19 @@ def forwarding_target(html, base_url):
 
 
 def no_forward_message(html, base_url):
-    """Say why no forward was found - the three reasons are not the same thing.
+    """Say why no forward was found - the four reasons are not the same thing.
 
-    Nothing off-site is a page rendering its own content, and the destination.
-    Several with none of them named is a forward this tool declined to guess at.
-    A candidate with nothing corroborating it is a third thing again. Reporting
-    all three as the first one states a failure to decide as a fact.
+    No links whatsoever is an empty shell, which forwards from its script if it
+    forwards at all - the one case where there was nothing to read. Nothing
+    off-site, among links that do exist, is a page rendering its own content,
+    and the destination. Several with none of them named is a forward this tool
+    declined to guess at. A candidate with nothing corroborating it is a fourth
+    thing again. Reporting all four as the destination states a failure to
+    decide, or a failure to see, as a fact.
     """
     facts = _page_facts(html)
+    if not facts.hrefs:
+        return NO_LINKS_MESSAGE
     if not _offsite_targets(facts, base_url):
         return DESTINATION_MESSAGE
     if _offsite_candidate(facts, base_url) is None:

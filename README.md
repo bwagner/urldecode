@@ -247,19 +247,28 @@ so the single-link rule declined it and the link was unresolvable. The
 tie-break can only ever fill in a blank: where exactly one off-site link
 already gave an answer, it changes nothing.
 
-**Neither.** Then no forward was found, and the reason matters, because three
+**Neither.** Then no forward was found, and the reason matters, because four
 different situations used to print the same line:
 
 ```console
   .. no forward in the page: this is the destination
   .. the page links off-site more than once and names no destination
   .. one off-site link, but nothing on the page corroborates it
+  .. no links at all in the page: if it forwards, it does so from its script
 ```
 
-Only the first is an arrival. The other two are this tool declining to guess,
-and reporting them as the first stated a failure to decide as a fact. All three
-separate "this is where you were going" from "it goes on and I cannot see how" -
-two situations the headers alone cannot tell apart.
+Only the first is an arrival. The others are this tool declining to guess, or
+never having had anything to read, and reporting them as the first stated a
+failure to decide as a fact. All four separate "this is where you were going"
+from "it goes on and I cannot see how" - two situations the headers alone
+cannot tell apart.
+
+The last line is the newest, and it costs something worth stating. A page whose
+markup carries no links at all is either a forwarder driven by its script or a
+page that renders its own content from one, and without executing that script
+the two are the same page. So neither is called the destination now, including
+the client-rendered landing page that used to be - that answer happened to be
+right, but nothing had been checked that a forwarder would have failed.
 
 A page whose destination exists only inside its JavaScript, computed or fetched
 rather than written in the markup, is out of scope. Reading it properly needs a

@@ -23,6 +23,7 @@ from urldecode import (
     TOR_SOCKS_PORT,
     REQUEST_FAILED_MESSAGE,
     SCHEME_MESSAGE,
+    NO_LINKS_MESSAGE,
     UNCORROBORATED_MESSAGE,
     UNREACHED_LABEL,
     UNREAD_MESSAGE,
@@ -379,6 +380,32 @@ window.__DATA__ = {"links":[
 </html>
 """
 LANDING_PAGE_URL = "https://short.example/m/Example-Event-"
+# A page that links, and links only within its own host: the one shape that
+# earns "this is the destination", since something was read and it went nowhere.
+SAME_HOST_ONLY_PAGE = """\
+<html>
+<head><title>Example News - An article</title></head>
+<body>
+<a href="/">Home</a>
+<a href="/section/world">World</a>
+<a href="https://news.example/about">About us</a>
+<p>The article itself.</p>
+</body>
+</html>
+"""
+SAME_HOST_ONLY_URL = "https://news.example/story/1"
+# The shape a deep-link page takes: markup that renders nothing and links
+# nowhere, with whatever it does held inside the script. Modelled on a real one,
+# which carried 34KB of script, no anchors and not even a <title>.
+SCRIPTED_SHELL_PAGE = """\
+<html>
+<head><meta name="viewport" content="width=device-width"></head>
+<body>
+<script nonce="synthetic">window.__DDL__ = {"t": "deeplink"}; render();</script>
+</body>
+</html>
+"""
+SCRIPTED_SHELL_URL = "https://link.example/abc123"
 
 
 # --- <meta refresh>: a declared forward -------------------------------------
@@ -678,8 +705,17 @@ def test_a_page_that_forwards_nowhere_is_named_the_destination():
     # The whole point of reading the body: "no redirect" covered both "this is
     # where you were going" and "it goes on and I cannot see how". Now it does not.
     messages = []
-    assert _forwarding_hop(CLIENT_RENDERED_LANDING_PAGE, LANDING_PAGE_URL, messages.append) is None
+    assert _forwarding_hop(SAME_HOST_ONLY_PAGE, SAME_HOST_ONLY_URL, messages.append) is None
     assert any("destination" in m for m in messages)
+
+
+def test_a_client_rendered_page_is_not_named_the_destination():
+    # It settles the same way - there is nothing to hop to - but the claim is
+    # withdrawn. This page and a script-driven forwarder are the same page to a
+    # parser, and only one of them is an arrival.
+    messages = []
+    assert _forwarding_hop(CLIENT_RENDERED_LANDING_PAGE, LANDING_PAGE_URL, messages.append) is None
+    assert not any("destination" in m for m in messages)
 
 
 # --- tracking that hides in the fragment -------------------------------------
@@ -1071,13 +1107,14 @@ def test_offsite_targets_counts_a_repeated_target_once():
 
 # --- saying why no forward was found -----------------------------------------
 #
-# "no forward in the page: this is the destination" was printed for three
+# "no forward in the page: this is the destination" was printed for four
 # different situations, only one of which it describes. A page that forwards
-# somewhere this tool cannot pin down is not a page that forwards nowhere.
+# somewhere this tool cannot pin down is not a page that forwards nowhere, and a
+# page carrying no links at all was never read in the first place.
 
 
 def test_a_page_that_links_nowhere_off_site_is_the_destination():
-    assert no_forward_message(CLIENT_RENDERED_LANDING_PAGE, LANDING_PAGE_URL) == DESTINATION_MESSAGE
+    assert no_forward_message(SAME_HOST_ONLY_PAGE, SAME_HOST_ONLY_URL) == DESTINATION_MESSAGE
 
 
 def test_several_off_site_links_and_no_candidate_is_reported_as_ambiguous():
@@ -1088,6 +1125,23 @@ def test_several_off_site_links_and_no_candidate_is_reported_as_ambiguous():
 def test_a_candidate_without_a_title_is_reported_as_uncorroborated():
     html = '<a href="https://news.example/x">Continue</a>'
     assert no_forward_message(html, INTERSTITIAL_URL) == UNCORROBORATED_MESSAGE
+
+
+def test_a_page_with_no_links_at_all_says_so():
+    # Nothing was read, so nothing is claimed. The destination message is earned
+    # by finding links and following none of them off-site.
+    assert no_forward_message(SCRIPTED_SHELL_PAGE, SCRIPTED_SHELL_URL) == NO_LINKS_MESSAGE
+
+
+def test_a_client_rendered_page_gets_the_same_answer_as_a_shell():
+    # These two are indistinguishable without running their scripts, so they are
+    # reported identically rather than guessed at. This is the case that used to
+    # come back as "this is the destination".
+    assert no_forward_message(CLIENT_RENDERED_LANDING_PAGE, LANDING_PAGE_URL) == NO_LINKS_MESSAGE
+
+
+def test_a_shell_is_not_announced_as_the_destination():
+    assert "destination" not in NO_LINKS_MESSAGE
 
 
 def test_an_ambiguous_page_is_not_announced_as_the_destination():
