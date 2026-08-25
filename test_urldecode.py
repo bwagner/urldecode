@@ -1,7 +1,10 @@
 """Tests for urldecode: unwrapping redirector links and stripping tracking params."""
 
+import re
 import socket
+import sys
 import urllib.parse as ul
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -1054,3 +1057,44 @@ def test_the_attempt_cap_can_be_raised_from_the_command_line():
 
 def test_the_attempt_cap_has_a_long_form():
     assert _parser().parse_args(["--max-attempts", "12"]).max_attempts == 12
+
+
+# --- the README's Usage block -----------------------------------------------
+#
+# That block is help output pasted in by hand, and nothing regenerates it: it
+# was stale from before -T existed and was only noticed while adding -a. This
+# test is what pins it. To regenerate the block after a CLI change:
+#
+#   COLUMNS=80 ./urldecode.py --help
+#
+# argparse wraps to the terminal width and takes the program name from
+# sys.argv[0], so this test fixes both. Before 3.13 it rendered a short and
+# long option pair as "-a N, --max-attempts N" rather than "-a, --max-attempts
+# N" - a difference in the interpreter, not a stale README - so the comparison
+# is skipped there rather than failing misleadingly.
+
+README = Path(__file__).parent / "README.md"
+USAGE_HEADING = "## Usage"
+FENCE = "```"
+USAGE_BLOCK = re.compile(rf"{USAGE_HEADING}\n\n{FENCE}\n(.*?){FENCE}\n", re.DOTALL)
+COLUMNS_ENV = "COLUMNS"
+HELP_COLUMNS = 80
+HELP_PROG = "urldecode.py"
+ARGPARSE_PAIRED_OPTIONS = (3, 13)
+
+
+def readme_usage_block():
+    """The fenced block under the README's Usage heading, which should be the help text."""
+    found = USAGE_BLOCK.search(README.read_text())
+    assert found, f"no fenced block under {USAGE_HEADING!r} in {README}"
+    return found.group(1)
+
+
+@pytest.mark.skipif(
+    sys.version_info < ARGPARSE_PAIRED_OPTIONS,
+    reason="argparse renders short and long option pairs differently before 3.13",
+)
+def test_the_readme_usage_block_is_the_parsers_help(monkeypatch):
+    monkeypatch.setenv(COLUMNS_ENV, str(HELP_COLUMNS))
+    monkeypatch.setattr(sys, "argv", [HELP_PROG])
+    assert readme_usage_block() == _parser().format_help()
