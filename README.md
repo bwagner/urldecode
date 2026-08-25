@@ -335,6 +335,28 @@ Requests also carry the header set a browser sends (`Accept`,
 `User-Agent` alone, since a WAF scoring a request on more than its UA reads a
 bare two-header request as automation.
 
+### A URL that arrived without a scheme
+
+A link copied out of running text often arrives bare - `tinyurl.com/x`, with no
+`http://` in front of it. httpx refuses such a URL outright rather than assume
+anything about it, so under `--follow` this used to end in a traceback, after
+tor had already been started and paid for. A missing scheme is now filled in
+with `https://`, and the assumption is stated rather than made quietly:
+
+```console
+$ urldecode.py -n 'tinyurl.com/stadiband20260304?t=49'
+from command line: tinyurl.com/stadiband20260304?t=49
+  .. no scheme given, assuming https://
+unwrapped:
+https://tinyurl.com/stadiband20260304?t=49
+```
+
+The test is a literal `http://`/`https://` prefix rather than the scheme
+`urlsplit` reports, which reads `localhost:8080/x` as the scheme `localhost` -
+exactly the input the repair exists for. Being that blunt costs one thing:
+`mailto:me@example.com` comes back with an `https://` on the front. Following a
+mailto was never on the table.
+
 ### tor
 
 `--follow` needs tor and will not fall back to a direct connection. Three cases:

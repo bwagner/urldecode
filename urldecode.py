@@ -16,6 +16,9 @@ from html.parser import HTMLParser
 from typing import NamedTuple, Optional
 
 URL_SCHEMES = ("https://", "http://")
+# What a URL pasted out of running text is missing. Every shortener worth
+# following speaks https, and a host that does not will redirect us to itself.
+DEFAULT_SCHEME = "https://"
 PARAM_SEP = "&"
 KV_SEP = "="
 
@@ -232,6 +235,22 @@ def unwrap(url):
     return strip_tracking(unredirect(url))
 
 
+def with_scheme(url):
+    """Give a URL the scheme it arrived without, so that it can be requested.
+
+    A link copied out of running text is often bare - "tinyurl.com/x" - and
+    httpx refuses such a URL outright rather than assuming anything about it.
+    The test is a literal prefix and not `urlsplit(url).scheme`, which reads
+    "localhost:8080/x" as the scheme "localhost" and would leave untouched the
+    very shape this exists to repair. The cost of being that blunt is that
+    "mailto:me@example.com" comes back with an https:// on the front; following
+    a mailto is not something this tool was ever going to do.
+    """
+    if not url.strip() or url.lower().startswith(URL_SCHEMES):
+        return url
+    return DEFAULT_SCHEME + url
+
+
 # --- reading a page that forwards on -----------------------------------------
 #
 # A shortener answering 200 text/html has not necessarily arrived; the page may
@@ -269,6 +288,9 @@ UNCORROBORATED_MESSAGE = "  .. one off-site link, but nothing on the page corrob
 # above are earned by parsing; this one says only that nothing looked, so it
 # must not borrow their "this is the destination".
 UNREAD_MESSAGE = "  .. off the host asked, page not read"
+# Also a decision rather than a finding, and the one place this tool alters the
+# URL it was handed rather than reading it, so it says so before going on.
+SCHEME_MESSAGE = "  .. no scheme given, assuming " + DEFAULT_SCHEME
 # The two kinds of answer this tool can end on: one read out of a wrapper or
 # confirmed by a server, one read off a page's shape. They print differently so
 # that a glance at the trace says which one reached stdout and the clipboard.
@@ -484,8 +506,14 @@ def same_host(url, other):
     arrival somewhere new. Subdomains are, deliberately - folding `www.` in
     would mean deciding which subdomains count as one site, which needs a
     public-suffix rule rather than a guess.
+
+    A URL with no host at all matches nothing, not even another URL with no
+    host. `urlsplit` reports a missing host as None, and two absences are not a
+    thing in common - left equal, they would open the body pass on any pair of
+    scheme-less URLs, which is exactly the input the gate is there to judge.
     """
-    return ul.urlsplit(url).hostname == ul.urlsplit(other).hostname
+    host = ul.urlsplit(url).hostname
+    return host is not None and host == ul.urlsplit(other).hostname
 
 
 def bounded_text(chunks, limit=MAX_BODY_BYTES):
@@ -914,6 +942,10 @@ def main(argv=None):
     # raw thing it yielded, tracking included. Extracting a target from a wrapper
     # and following a redirect are the same move, so they read the same way.
     report(f"from {source}: {url}")
+    schemed = with_scheme(url)
+    if schemed != url:
+        report(SCHEME_MESSAGE)
+        url = schemed
     target = unredirect(url)
     if target != url:
         report(f"  -> {target}")

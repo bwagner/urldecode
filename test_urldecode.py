@@ -13,12 +13,14 @@ from urldecode import (
     AMBIGUOUS_MESSAGE,
     BLOCKED_LABEL,
     BLOCKING_STATUSES,
+    DEFAULT_SCHEME,
     DESTINATION_MESSAGE,
     INFERRED_LABEL,
     MAX_BLOCKED_ATTEMPTS,
     SOCKS_SCHEME,
     TOR_SOCKS_HOST,
     TOR_SOCKS_PORT,
+    SCHEME_MESSAGE,
     UNCORROBORATED_MESSAGE,
     UNREAD_MESSAGE,
     UNWRAPPED_LABEL,
@@ -47,6 +49,7 @@ from urldecode import (
     unblocked_response,
     unredirect,
     unwrap,
+    with_scheme,
 )
 
 # A real l.facebook.com wrapper, with the click-identifying tokens (fbclid, h,
@@ -1154,3 +1157,59 @@ def test_the_readme_usage_block_is_the_parsers_help(monkeypatch):
     monkeypatch.setenv(COLUMNS_ENV, str(HELP_COLUMNS))
     monkeypatch.setattr(sys, "argv", [HELP_PROG])
     assert readme_usage_block() == _parser().format_help()
+
+
+# --- a URL that arrived without a scheme -------------------------------------
+#
+# Bare "tinyurl.com/x" is what a link copied out of running text looks like.
+# Offline it used to pass straight through and be handed back as the answer;
+# under --follow httpx refused it outright and the traceback was the whole
+# output. The repair is made where the URL is read, and announced.
+
+
+def test_a_bare_host_is_given_a_scheme():
+    assert with_scheme("tinyurl.com/stadiband20260304?t=49") == (
+        DEFAULT_SCHEME + "tinyurl.com/stadiband20260304?t=49"
+    )
+
+
+def test_a_url_that_has_a_scheme_is_untouched():
+    assert with_scheme("https://example.com/x") == "https://example.com/x"
+    assert with_scheme("http://example.com/x") == "http://example.com/x"
+
+
+def test_the_scheme_is_recognised_whatever_its_case():
+    # Mail clients and spreadsheets capitalise it; prepending a second scheme
+    # would produce a URL that resolves nowhere at all.
+    assert with_scheme("HTTPS://example.com/x") == "HTTPS://example.com/x"
+
+
+def test_a_host_and_port_is_not_read_as_a_scheme():
+    # The reason the test is a literal prefix: urlsplit reads the scheme of
+    # "localhost:8080/x" as "localhost", so a check on urlsplit().scheme would
+    # leave this exact input for httpx to refuse.
+    assert with_scheme("localhost:8080/x") == DEFAULT_SCHEME + "localhost:8080/x"
+
+
+def test_nothing_at_all_stays_nothing():
+    # An empty clipboard is not a URL missing its scheme, and "https://" is a
+    # worse answer than the emptiness it came from.
+    assert with_scheme("") == ""
+    assert with_scheme("   ") == "   "
+
+
+def test_a_hostless_url_shares_its_host_with_nothing():
+    # urlsplit reports both of these hosts as None. Read as equal, two
+    # unrelated scheme-less URLs would count as the same host and open the
+    # body pass on a page the chain never asked about.
+    assert same_host("a.example.com/x", "b.example.com/y") is False
+
+
+def test_a_hostless_url_is_not_even_its_own_host():
+    assert same_host("example.com/x", "example.com/x") is False
+
+
+def test_assuming_a_scheme_is_announced():
+    # The one place this tool changes the URL it was handed rather than reading
+    # it, so it must not happen silently.
+    assert SCHEME_MESSAGE.endswith(DEFAULT_SCHEME)
