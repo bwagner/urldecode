@@ -20,8 +20,10 @@ from urldecode import (
     SOCKS_SCHEME,
     TOR_SOCKS_HOST,
     TOR_SOCKS_PORT,
+    REQUEST_FAILED_MESSAGE,
     SCHEME_MESSAGE,
     UNCORROBORATED_MESSAGE,
+    UNREACHED_LABEL,
     UNREAD_MESSAGE,
     UNWRAPPED_LABEL,
     TorCheckFailed,
@@ -1213,3 +1215,41 @@ def test_assuming_a_scheme_is_announced():
     # The one place this tool changes the URL it was handed rather than reading
     # it, so it must not happen silently.
     assert SCHEME_MESSAGE.endswith(DEFAULT_SCHEME)
+
+
+# --- a request that never completed ------------------------------------------
+#
+# Everything above assumes a server answered. When httpx raises instead - a URL
+# it will not form, a name that does not resolve, a circuit that dies mid-body -
+# the chain has no answer, and used to have no trace either: the traceback was
+# the entire output. A failure is not a refusal, so it gets its own label.
+
+
+def test_a_chain_that_never_landed_is_not_called_a_destination():
+    result, label = chosen_result("https://tinyurl.com/x", None, True, unreached=True)
+    assert label is UNREACHED_LABEL
+    assert result == "https://tinyurl.com/x"
+
+
+def test_a_refusal_and_a_failure_are_told_apart():
+    # Both mean "only as far as this got", but a host that said no told us
+    # something about the URL and a request that never landed did not.
+    _, refused = chosen_result("https://x/y", None, True, blocked=True)
+    _, failed = chosen_result("https://x/y", None, True, unreached=True)
+    assert refused is BLOCKED_LABEL
+    assert failed is UNREACHED_LABEL
+
+
+def test_an_inferred_forward_still_wins_over_a_failure():
+    # A candidate can only exist because a page was read, which means a request
+    # did land. The failure that follows does not unmake the finding.
+    result, label = chosen_result("https://x/y", "https://real/z", True, unreached=True)
+    assert (result, label) == ("https://real/z", INFERRED_LABEL)
+
+
+def test_a_failure_names_its_reason():
+    # "ConnectError" alone would not distinguish a dead circuit from a URL that
+    # was never valid, and the difference is the whole diagnosis.
+    line = REQUEST_FAILED_MESSAGE.format(reason="UnsupportedProtocol: missing an http://")
+    assert "UnsupportedProtocol" in line
+    assert line.startswith("  ..")

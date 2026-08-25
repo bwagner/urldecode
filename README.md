@@ -335,7 +335,7 @@ Requests also carry the header set a browser sends (`Accept`,
 `User-Agent` alone, since a WAF scoring a request on more than its UA reads a
 bare two-header request as automation.
 
-### A URL that arrived without a scheme
+### When there is no answer at all
 
 A link copied out of running text often arrives bare - `tinyurl.com/x`, with no
 `http://` in front of it. httpx refuses such a URL outright rather than assume
@@ -356,6 +356,22 @@ The test is a literal `http://`/`https://` prefix rather than the scheme
 exactly the input the repair exists for. Being that blunt costs one thing:
 `mailto:me@example.com` comes back with an `https://` on the front. Following a
 mailto was never on the table.
+
+That was one instance of a wider gap. A request can fail to happen at all -
+a URL httpx will not form, a host name that does not resolve, a circuit that
+dies mid-body - and none of those is an answer about the URL. They now end the
+chain the way everything else does, in the trace, under a fourth label:
+
+```console
+  .. the request did not complete: ConnectError: All connection attempts failed
+unreached:
+https://tinyurl.com/x
+```
+
+`unreached:` is deliberately not `blocked:`. A host that refuses us has told us
+something about the URL; a request that never landed has told us nothing, and
+the two want different next moves - a retry on a fresh circuit is the answer to
+one and useless against the other.
 
 ### tor
 

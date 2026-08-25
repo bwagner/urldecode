@@ -299,6 +299,14 @@ INFERRED_LABEL = "inferred:"
 # Not an answer at all: the host refused every circuit, so the URL below is
 # only as far as this got.
 BLOCKED_LABEL = "blocked:"
+# Nor is this one, and for a different reason: a request that never completed
+# is not a refusal by the host, it is not knowing whether there was one.
+UNREACHED_LABEL = "unreached:"
+# httpx answers a URL it cannot even form (no scheme, a port that is not a
+# number) the same way it answers a circuit that died mid-hop: by raising. Both
+# say the chain stopped without an answer, which is a fact about the chain and
+# belongs in the trace, not a traceback where the trace should have been.
+REQUEST_FAILED_MESSAGE = "  .. the request did not complete: {reason}"
 
 
 class Forward(NamedTuple):
@@ -697,7 +705,9 @@ def _read_forward(client_for, url, report, note=None, blocked=None, attempts=MAX
         return _forwarding_hop(bounded_text(streamed.iter_bytes()), url, report, note)
 
 
-def tor_resolver(socks_port, report, origin, note=None, blocked=None, attempts=MAX_BLOCKED_ATTEMPTS):
+def tor_resolver(
+    socks_port, report, origin, note=None, blocked=None, unreached=None, attempts=MAX_BLOCKED_ATTEMPTS
+):
     """Return (resolve, close): resolve(url) reads one hop through tor.
 
     Headers alone answer the question for a redirect. A page that settles is
@@ -723,7 +733,7 @@ def tor_resolver(socks_port, report, origin, note=None, blocked=None, attempts=M
             )
         return clients[attempt]
 
-    def resolve(url):
+    def hop(url):
         response = unblocked_response(
             lambda attempt: client_for(attempt).head(url), attempts=attempts, report=report
         )
@@ -754,6 +764,23 @@ def tor_resolver(socks_port, report, origin, note=None, blocked=None, attempts=M
             report(UNREAD_MESSAGE)
             return None
         return _read_forward(client_for, url, report, note, blocked, attempts)
+
+    def resolve(url):
+        """One hop, or the reason there was not one.
+
+        Every way a request can fail to happen at all arrives here as an
+        exception: a URL httpx will not form, a name that does not resolve, a
+        circuit that dies mid-body. None of them is an answer about the URL, so
+        none of them may end the chain quietly - the reason goes in the trace
+        and the caller is told the chain never landed.
+        """
+        try:
+            return hop(url)
+        except (httpx.HTTPError, httpx.InvalidURL) as exc:
+            report(REQUEST_FAILED_MESSAGE.format(reason=f"{type(exc).__name__}: {exc}"))
+            if unreached is not None:
+                unreached()
+            return None
 
     def close():
         for client in clients.values():
@@ -834,7 +861,9 @@ def tor_socks_port(report):
     return TOR_LAUNCH_PORT, start_tor(report)
 
 
-def resolve_through_tor(url, report, note=None, blocked=None, attempts=MAX_BLOCKED_ATTEMPTS):
+def resolve_through_tor(
+    url, report, note=None, blocked=None, unreached=None, attempts=MAX_BLOCKED_ATTEMPTS
+):
     """Follow url to its destination over tor, cleaning it at every hop."""
     port, started = tor_socks_port(report)
     close = None
@@ -843,7 +872,9 @@ def resolve_through_tor(url, report, note=None, blocked=None, attempts=MAX_BLOCK
         # follow() unwraps before its first request, so the host this chain is
         # really about is the unwrapped one - not l.facebook.com, but whatever
         # the wrapper was carrying.
-        resolve, close = tor_resolver(port, report, unwrap(url), note, blocked, attempts)
+        resolve, close = tor_resolver(
+            port, report, unwrap(url), note, blocked, unreached, attempts
+        )
 
         def reporting_resolve(target):
             location = resolve(target)
@@ -864,21 +895,25 @@ def resolve_through_tor(url, report, note=None, blocked=None, attempts=MAX_BLOCK
             started.kill()
 
 
-def chosen_result(settled, inferred, trust, blocked=False):
+def chosen_result(settled, inferred, trust, blocked=False, unreached=False):
     """Return the URL to print, and the label that says what kind it is.
 
     A candidate read off a page's shape is the answer when there is one, since
     it is the answer the user came for - but never silently: it is labelled for
     what it is, and --no-trust-inferred keeps the URL that actually settled.
 
-    A chain that was refused on every circuit has no answer at all. The URL it
-    reached is still printed, being the best that is known, but under a label
-    that does not call it a destination.
+    A chain that was refused on every circuit has no answer at all, and neither
+    has one whose request never completed. The URL each reached is still
+    printed, being the best that is known, but under a label that does not call
+    it a destination - and the two are told apart, because a host that said no
+    told us something and a request that never landed did not.
     """
     if trust and inferred is not None:
         return inferred, INFERRED_LABEL
     if blocked:
         return settled, BLOCKED_LABEL
+    if unreached:
+        return settled, UNREACHED_LABEL
     return settled, UNWRAPPED_LABEL
 
 
@@ -952,6 +987,7 @@ def main(argv=None):
 
     inferred = None
     refused = False
+    landed = True
 
     def note(candidate):
         """Remember a forward this tool read off a page but did not follow."""
@@ -963,16 +999,25 @@ def main(argv=None):
         nonlocal refused
         refused = True
 
+    def unreached():
+        """Remember that a request never completed, so nothing was refused or found."""
+        nonlocal landed
+        landed = False
+
     cleaned = unwrap(url)
     if args.follow:
         # Before tor is even started: this, not the line above, is what will go
         # over the wire.
         report(f"  => {cleaned}")
-        settled = resolve_through_tor(url, report, note, blocked, args.max_attempts)
+        settled = resolve_through_tor(
+            url, report, note, blocked, unreached, args.max_attempts
+        )
     else:
         settled = cleaned
 
-    result, label = chosen_result(settled, inferred, args.trust_inferred, refused)
+    result, label = chosen_result(
+        settled, inferred, args.trust_inferred, refused, not landed
+    )
     report(label)
     print(result)
 
