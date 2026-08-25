@@ -256,6 +256,10 @@ DECODE_ERRORS = "replace"
 FORWARD_MARKER = "  ?? forwards to"
 TITLE_INDENT = "     "
 DESTINATION_MESSAGE = "  .. no forward in the page: this is the destination"
+# A page that forwards somewhere this tool cannot pin down is not a page that
+# forwards nowhere, and the line above used to claim it was.
+AMBIGUOUS_MESSAGE = "  .. the page links off-site more than once and names no destination"
+UNCORROBORATED_MESSAGE = "  .. one off-site link, but nothing on the page corroborates it"
 # The two kinds of answer this tool can end on: one read out of a wrapper or
 # confirmed by a server, one read off a page's shape. They print differently so
 # that a glance at the trace says which one reached stdout and the clipboard.
@@ -288,14 +292,31 @@ class _PageFacts(HTMLParser):
         self.refresh = None
         self.title = None
         self.hrefs = []
+        # (href, text) for every anchor that closed. What a link says it goes
+        # to, beside where it goes.
+        self.anchors = []
+        self._open_href = None
+        self._open_text = []
 
     def handle_starttag(self, tag, attrs):
         # HTMLParser lowercases tag and attribute names, but not their values.
         attributes = {name: value or "" for name, value in attrs}
         if tag == META_TAG:
             self._read_meta(attributes)
-        elif tag == ANCHOR_TAG and attributes.get(HREF_ATTRIBUTE):
-            self.hrefs.append(attributes[HREF_ATTRIBUTE])
+        elif tag == ANCHOR_TAG:
+            href = attributes.get(HREF_ATTRIBUTE)
+            if href:
+                self.hrefs.append(href)
+            self._open_href, self._open_text = href or None, []
+
+    def handle_data(self, data):
+        if self._open_href is not None:
+            self._open_text.append(data)
+
+    def handle_endtag(self, tag):
+        if tag == ANCHOR_TAG and self._open_href is not None:
+            self.anchors.append((self._open_href, "".join(self._open_text)))
+            self._open_href = None
 
     def _read_meta(self, attributes):
         if attributes.get(HTTP_EQUIV_ATTRIBUTE, "").lower() == REFRESH_EQUIV:
@@ -334,14 +355,54 @@ def meta_refresh_target(html, base_url):
     return _refresh_url(_page_facts(html).refresh, base_url)
 
 
-def _sole_offsite(facts, base_url):
+def _is_offsite(target, base_url):
     host = ul.urlsplit(base_url).netloc
+    return ul.urlsplit(target).netloc not in SAME_PAGE_NETLOCS + (host,)
+
+
+def _offsite_targets(facts, base_url):
     targets = []
     for href in facts.hrefs:
         target = ul.urljoin(base_url, href)
-        if ul.urlsplit(target).netloc not in SAME_PAGE_NETLOCS + (host,) and target not in targets:
+        if _is_offsite(target, base_url) and target not in targets:
             targets.append(target)
+    return targets
+
+
+def _sole_offsite(facts, base_url):
+    targets = _offsite_targets(facts, base_url)
     return targets[0] if len(targets) == 1 else None
+
+
+def _named_offsite(facts, base_url):
+    """The one off-site link whose visible text is the URL it points at.
+
+    A page about to forward you shows the destination; that is what an
+    interstitial is for. A "Learn more" beside it never does. So a page linking
+    off-site more than once can still name which of them is the way out.
+    """
+    named = []
+    for href, text in facts.anchors:
+        target = ul.urljoin(base_url, href)
+        if _is_offsite(target, base_url) and text.strip() == target and target not in named:
+            named.append(target)
+    return named[0] if len(named) == 1 else None
+
+
+def _offsite_candidate(facts, base_url):
+    """The off-site URL this page's shape points at, before corroboration."""
+    sole = _sole_offsite(facts, base_url)
+    return sole if sole is not None else _named_offsite(facts, base_url)
+
+
+def offsite_targets(html, base_url):
+    """Every distinct URL the page links to outside its own host, in order."""
+    return _offsite_targets(_page_facts(html), base_url)
+
+
+def named_offsite_anchor(html, base_url):
+    """The single off-site URL the page prints as its own link text, or None."""
+    return _named_offsite(_page_facts(html), base_url)
 
 
 def sole_offsite_anchor(html, base_url):
@@ -373,10 +434,26 @@ def forwarding_target(html, base_url):
     declared = _refresh_url(facts.refresh, base_url)
     if declared is not None:
         return Forward(declared, True, facts.title)
-    inferred = _sole_offsite(facts, base_url)
+    inferred = _offsite_candidate(facts, base_url)
     if inferred is not None and facts.title:
         return Forward(inferred, False, facts.title)
     return None
+
+
+def no_forward_message(html, base_url):
+    """Say why no forward was found - the three reasons are not the same thing.
+
+    Nothing off-site is a page rendering its own content, and the destination.
+    Several with none of them named is a forward this tool declined to guess at.
+    A candidate with nothing corroborating it is a third thing again. Reporting
+    all three as the first one states a failure to decide as a fact.
+    """
+    facts = _page_facts(html)
+    if not _offsite_targets(facts, base_url):
+        return DESTINATION_MESSAGE
+    if _offsite_candidate(facts, base_url) is None:
+        return AMBIGUOUS_MESSAGE
+    return UNCORROBORATED_MESSAGE
 
 
 def worth_reading(response):
@@ -420,7 +497,7 @@ def _forwarding_hop(html, url, report, note=None):
     """
     forward = forwarding_target(html, url)
     if forward is None:
-        report(DESTINATION_MESSAGE)
+        report(no_forward_message(html, url))
         return None
     if forward.declared:
         return forward.url

@@ -7,12 +7,15 @@ from types import SimpleNamespace
 import pytest
 
 from urldecode import (
+    AMBIGUOUS_MESSAGE,
     BLOCKED_LABEL,
     BLOCKING_STATUSES,
+    DESTINATION_MESSAGE,
     INFERRED_LABEL,
     SOCKS_SCHEME,
     TOR_SOCKS_HOST,
     TOR_SOCKS_PORT,
+    UNCORROBORATED_MESSAGE,
     UNWRAPPED_LABEL,
     TorCheckFailed,
     _proxy_url,
@@ -27,6 +30,9 @@ from urldecode import (
     is_blocked,
     needs_get,
     meta_refresh_target,
+    named_offsite_anchor,
+    no_forward_message,
+    offsite_targets,
     og_title,
     sole_offsite_anchor,
     worth_reading,
@@ -881,3 +887,142 @@ def test_every_refusal_is_worth_a_get():
     # The two predicates must not drift apart: anything is_blocked() retries on
     # a new circuit is also something a GET should be tried on.
     assert all(needs_get(status) for status in BLOCKING_STATUSES)
+
+
+# --- a page that names its own destination -----------------------------------
+#
+# lnkd.in's interstitial links off-site twice: to the destination, and to a
+# LinkedIn help page - off-site because the page itself is on lnkd.in. The
+# sole-anchor rule declines that, correctly, and the link is unresolvable.
+#
+# What separates the two is that a forwarding page shows you the URL it is
+# about to send you to. "Learn more" never does. Modelled on the real page
+# fetched over tor on 2026-08-25, structure copied exactly, destination
+# synthetic.
+
+INTERSTITIAL_PAGE = """\
+<html lang="en">
+<head>
+<meta name="pageKey" content="d_shortlink_frontend_external_link_redirect_interstitial">
+<meta property="og:title" content="LinkedIn">
+</head>
+<body>
+<a class="artdeco-button artdeco-button--tertiary" data-tracking-control-name="external_url_click"
+   data-tracking-will-navigate href="https://news.example/story-456">
+    https://news.example/story-456
+</a>
+<a class="t-14 artdeco-button artdeco-button--tertiary" data-tracking-control-name="learn_more_click"
+   data-tracking-will-navigate href="https://help.example/answer/a1341680?trk=in_page_learn_more_click"
+   target="_blank">
+    Learn more
+</a>
+</body>
+</html>
+"""
+INTERSTITIAL_URL = "https://short.example/edx9SEqJ"
+INTERSTITIAL_TARGET = "https://news.example/story-456"
+
+
+def test_the_interstitial_links_off_site_more_than_once():
+    # The premise of the whole rule: this is why the sole-anchor test fails here.
+    assert len(offsite_targets(INTERSTITIAL_PAGE, INTERSTITIAL_URL)) > 1
+    assert sole_offsite_anchor(INTERSTITIAL_PAGE, INTERSTITIAL_URL) is None
+
+
+def test_an_anchor_that_prints_its_own_url_is_the_forward():
+    assert named_offsite_anchor(INTERSTITIAL_PAGE, INTERSTITIAL_URL) == INTERSTITIAL_TARGET
+
+
+def test_the_interstitial_now_yields_its_destination():
+    forward = forwarding_target(INTERSTITIAL_PAGE, INTERSTITIAL_URL)
+    assert forward.url == INTERSTITIAL_TARGET
+    assert forward.declared is False
+
+
+def test_whitespace_around_the_printed_url_does_not_matter():
+    html = '<a href="https://news.example/x">\n      https://news.example/x\n   </a>'
+    assert named_offsite_anchor(html, INTERSTITIAL_URL) == "https://news.example/x"
+
+
+def test_an_anchor_whose_text_is_a_label_names_nothing():
+    html = '<a href="https://news.example/x">Continue</a><a href="https://other.example/y">Help</a>'
+    assert named_offsite_anchor(html, INTERSTITIAL_URL) is None
+
+
+def test_an_anchor_printing_a_different_url_than_it_points_at_names_nothing():
+    # The shape a deceptive link takes; it must not be read as a forward.
+    html = '<a href="https://evil.example/x">https://news.example/x</a><a href="https://other.example/y">Help</a>'
+    assert named_offsite_anchor(html, INTERSTITIAL_URL) is None
+
+
+def test_two_anchors_printing_their_own_urls_are_still_ambiguous():
+    html = (
+        '<a href="https://news.example/x">https://news.example/x</a>'
+        '<a href="https://other.example/y">https://other.example/y</a>'
+    )
+    assert named_offsite_anchor(html, INTERSTITIAL_URL) is None
+
+
+def test_a_named_anchor_still_needs_og_title_to_corroborate_it():
+    html = INTERSTITIAL_PAGE.replace('<meta property="og:title" content="LinkedIn">', "")
+    assert named_offsite_anchor(html, INTERSTITIAL_URL) == INTERSTITIAL_TARGET
+    assert forwarding_target(html, INTERSTITIAL_URL) is None
+
+
+def test_a_declared_refresh_still_wins_over_a_named_anchor():
+    html = '<meta http-equiv="refresh" content="0; url=https://declared.example/z">' + INTERSTITIAL_PAGE
+    forward = forwarding_target(html, INTERSTITIAL_URL)
+    assert forward.url == "https://declared.example/z"
+    assert forward.declared is True
+
+
+def test_the_sole_anchor_rule_is_untouched_by_the_tie_break():
+    # The tie-break may only fill in a blank, never change an existing verdict.
+    assert forwarding_target(JS_FORWARDING_PAGE, JS_FORWARDING_PAGE_URL).url == JS_FORWARDING_TARGET
+    assert forwarding_target(CLIENT_RENDERED_LANDING_PAGE, LANDING_PAGE_URL) is None
+
+
+# --- listing what a page links off-site --------------------------------------
+
+
+def test_offsite_targets_keeps_document_order():
+    assert offsite_targets(INTERSTITIAL_PAGE, INTERSTITIAL_URL)[0] == INTERSTITIAL_TARGET
+
+
+def test_offsite_targets_ignores_links_back_into_the_page_host():
+    html = '<a href="/help">Help</a><a href="https://news.example/x">x</a>'
+    assert offsite_targets(html, INTERSTITIAL_URL) == ["https://news.example/x"]
+
+
+def test_offsite_targets_counts_a_repeated_target_once():
+    html = '<a href="https://news.example/x">a</a><a href="https://news.example/x">b</a>'
+    assert offsite_targets(html, INTERSTITIAL_URL) == ["https://news.example/x"]
+
+
+# --- saying why no forward was found -----------------------------------------
+#
+# "no forward in the page: this is the destination" was printed for three
+# different situations, only one of which it describes. A page that forwards
+# somewhere this tool cannot pin down is not a page that forwards nowhere.
+
+
+def test_a_page_that_links_nowhere_off_site_is_the_destination():
+    assert no_forward_message(CLIENT_RENDERED_LANDING_PAGE, LANDING_PAGE_URL) == DESTINATION_MESSAGE
+
+
+def test_several_off_site_links_and_no_candidate_is_reported_as_ambiguous():
+    html = '<a href="https://news.example/x">Continue</a><a href="https://other.example/y">Help</a>'
+    assert no_forward_message(html, INTERSTITIAL_URL) == AMBIGUOUS_MESSAGE
+
+
+def test_a_candidate_without_a_title_is_reported_as_uncorroborated():
+    html = '<a href="https://news.example/x">Continue</a>'
+    assert no_forward_message(html, INTERSTITIAL_URL) == UNCORROBORATED_MESSAGE
+
+
+def test_an_ambiguous_page_is_not_announced_as_the_destination():
+    messages = []
+    html = '<a href="https://news.example/x">Continue</a><a href="https://other.example/y">Help</a>'
+    assert _forwarding_hop(html, INTERSTITIAL_URL, messages.append) is None
+    assert messages == [AMBIGUOUS_MESSAGE]
+

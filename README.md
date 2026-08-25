@@ -207,16 +207,31 @@ answer, not what goes over the wire. `-T/--no-trust-inferred` declines it and
 keeps the URL that actually settled, on the `unwrapped:` line, with the `??`
 line still there to copy by hand.
 
-**Neither, or several links with no way to choose.** The page is reported as the
-destination, which is an answer rather than the absence of one:
+**It links off-site more than once, but prints one of them as its own link
+text.** A page about to forward you shows the URL it is about to send you to;
+that is what an interstitial is for. A "Learn more" beside it never does. So
+one off-site link whose visible text *is* the URL it points at is taken as the
+forward, and the `og:title` corroboration still has to agree.
+
+This is what `lnkd.in` needed. Its interstitial links to the destination and to
+a LinkedIn help page - off-site too, because the page itself is on `lnkd.in` -
+so the single-link rule declined it and the link was unresolvable. The
+tie-break can only ever fill in a blank: where exactly one off-site link
+already gave an answer, it changes nothing.
+
+**Neither.** Then no forward was found, and the reason matters, because three
+different situations used to print the same line:
 
 ```console
-  .. 200 text/html, no redirect
   .. no forward in the page: this is the destination
+  .. the page links off-site more than once and names no destination
+  .. one off-site link, but nothing on the page corroborates it
 ```
 
-That last line is what separates "this is where you were going" from "it goes on
-and I cannot see how" - two situations the headers alone cannot tell apart.
+Only the first is an arrival. The other two are this tool declining to guess,
+and reporting them as the first stated a failure to decide as a fact. All three
+separate "this is where you were going" from "it goes on and I cannot see how" -
+two situations the headers alone cannot tell apart.
 
 A page whose destination exists only inside its JavaScript, computed or fetched
 rather than written in the markup, is out of scope. Reading it properly needs a
@@ -342,9 +357,12 @@ forwarding_target(html, "https://short.example/abc")
 ```
 
 `declared` is provenance, not confidence: `True` means the page said so in a
-`<meta refresh>`, `False` means it was inferred from a sole off-site link.
-`meta_refresh_target(html, base)`, `sole_offsite_anchor(html, base)` and
-`og_title(html)` are available individually.
+`<meta refresh>`, `False` means it was read off the page's shape.
+`meta_refresh_target(html, base)`, `sole_offsite_anchor(html, base)`,
+`named_offsite_anchor(html, base)`, `offsite_targets(html, base)` and
+`og_title(html)` are available individually, as is
+`no_forward_message(html, base)`, which says why a page that does not forward
+on does not.
 
 `pyperclip` is imported lazily, so importing the module does not require it.
 
