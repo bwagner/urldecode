@@ -8,6 +8,7 @@ import pytest
 
 from urldecode import (
     BLOCKED_LABEL,
+    BLOCKING_STATUSES,
     INFERRED_LABEL,
     SOCKS_SCHEME,
     TOR_SOCKS_HOST,
@@ -24,6 +25,7 @@ from urldecode import (
     follow,
     forwarding_target,
     is_blocked,
+    needs_get,
     meta_refresh_target,
     og_title,
     sole_offsite_anchor,
@@ -849,3 +851,33 @@ def test_a_candidate_read_off_a_page_outranks_a_late_refusal():
     result, label = chosen_result("https://short.example/x", "https://example.com/real", True, blocked=True)
     assert (result, label) == ("https://example.com/real", INFERRED_LABEL)
 
+
+# --- asking again with a different verb --------------------------------------
+#
+# A HEAD that came back refused has not answered the question, and on lnkd.in
+# it is refused far harder than a GET is: 1 HEAD in 9 got through where 4 GETs
+# in 9 did, on fresh circuits with the same headers. So a refusal falls into
+# the same streamed-GET path that a host refusing HEAD outright already takes.
+
+
+@pytest.mark.parametrize("status", [405, 501])
+def test_a_host_that_refuses_the_method_is_asked_with_get(status):
+    assert needs_get(status)
+
+
+@pytest.mark.parametrize("status", [403, 429])
+def test_a_refused_head_is_asked_with_get_before_giving_up(status):
+    assert needs_get(status)
+
+
+@pytest.mark.parametrize("status", [200, 301, 404, 500])
+def test_an_answered_head_is_not_asked_again(status):
+    # These answered the question, even when the answer is bad news; asking the
+    # same URL again with another verb would learn nothing.
+    assert not needs_get(status)
+
+
+def test_every_refusal_is_worth_a_get():
+    # The two predicates must not drift apart: anything is_blocked() retries on
+    # a new circuit is also something a GET should be tried on.
+    assert all(needs_get(status) for status in BLOCKING_STATUSES)

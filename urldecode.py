@@ -81,6 +81,7 @@ METHOD_NOT_ALLOWED = (405, 501)
 BLOCKING_STATUSES = (403, 429)
 MAX_BLOCKED_ATTEMPTS = 3
 RETRY_MESSAGE = "  .. refused, retrying on a new circuit"
+GET_FALLBACK_MESSAGE = "  .. HEAD did not answer, asking with GET"
 BLOCKED_MESSAGE = "  .. refused on every circuit tried"
 LOCATION_HEADER = "location"
 CONTENT_TYPE_HEADER = "content-type"
@@ -483,6 +484,18 @@ def is_blocked(status):
     return status in BLOCKING_STATUSES
 
 
+def needs_get(status):
+    """True when a HEAD left the question open and a GET might still answer it.
+
+    Some hosts refuse the method outright (405/501). Some refuse the client,
+    and refuse HEAD harder than they refuse GET: on lnkd.in, over fresh
+    circuits with the same headers, 1 HEAD in 9 got through where 4 GETs in 9
+    did. Both cases are the same thing from here - nothing was learned - and
+    both take the same streamed-GET path.
+    """
+    return status in METHOD_NOT_ALLOWED or is_blocked(status)
+
+
 def unblocked_response(request, attempts=MAX_BLOCKED_ATTEMPTS, report=None):
     """Return the first response that was not a refusal, or the last refusal.
 
@@ -585,11 +598,11 @@ def tor_resolver(socks_port, report, note=None, blocked=None):
         response = unblocked_response(
             lambda attempt: client_for(attempt).head(url), report=report
         )
-        if _refused(response, report, blocked):
-            return None
-        if response.status_code in METHOD_NOT_ALLOWED:
-            # Some hosts refuse HEAD. Stream the GET so nothing is read beyond
-            # what the body pass below asks for.
+        if needs_get(response.status_code):
+            # Nothing was learned from the HEAD, whether the method was refused
+            # or this client was. Stream the GET so nothing is read beyond what
+            # the body pass below asks for.
+            report(GET_FALLBACK_MESSAGE)
             with ExitStack() as stack:
                 streamed = _open_get(stack, client_for, url, report)
                 if _refused(streamed, report, blocked):

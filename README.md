@@ -260,6 +260,16 @@ server failing at it; neither is about this client, and neither would change on
 a new exit. `MAX_BLOCKED_ATTEMPTS` (3) caps the retries, so a hard-blocking
 host costs three requests rather than one.
 
+A HEAD refused on every circuit then gets asked again with a GET, the same
+streamed-GET path a host refusing the method outright (`405`, `501`) already
+takes - `needs_get()` covers both, because from here they are the same thing:
+nothing was learned. This is not symmetry for its own sake. `lnkd.in` refuses
+HEAD far harder than GET; over fresh circuits with these headers, 1 HEAD in 9
+got through where 4 GETs in 9 did, and without the fallback every retry asked
+with the one verb that host almost always refuses. The cost is that a truly
+blocking host is asked six times rather than three, and a GET reads a few
+hundred bytes of refusal page where HEAD read none.
+
 The body pass is retried the same way, and its status is checked before its
 bytes are read - a refusal serves a short HTML page of its own, which forwards
 nowhere and would otherwise be announced as the destination.
