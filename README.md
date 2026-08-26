@@ -6,9 +6,8 @@ Unwraps redirector links that carry their destination in a query parameter -
 Facebook's `l.php?u=`, Google's `/url?q=`, and anything shaped like them - as
 pure text, and strips tracking parameters, including per-publisher click ids no
 denylist knows about. With `--follow` it also resolves shorteners whose target
-only the server knows, such as bit.ly, tinyurl or t.co, over tor - cleaning the
-URL *before* each request, so the shortener never receives the click id that
-sent you there.
+only the server knows, such as bit.ly, tinyurl or t.co, over [tor](https://www.torproject.org/) -
+cleaning the URL *before* each request, so the shortener never receives the click id that sent you there.
 
 No domain lists: any query parameter holding a URL, any redirect.
 
