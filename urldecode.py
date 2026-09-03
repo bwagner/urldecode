@@ -273,6 +273,75 @@ def with_scheme(url):
     return DEFAULT_SCHEME + url
 
 
+# --- finding the link in the text around it ----------------------------------
+#
+# A link is rarely copied alone: it arrives with the headline above it, an arrow
+# in front of it and a signature below. Only a scheme-ful URL is looked for.
+# Inside running prose there is no telling "mrf.lu/2Lhvb" from "etc. gerade" or
+# "z.B." without a public-suffix rule, and a guess would hand tor a host that
+# does not exist; a link that says https:// says it about itself.
+
+# What a sentence puts after a URL, and what a URL almost never ends on. The
+# trailing slash is deliberately not here: it belongs to the path.
+TRAILING_PUNCTUATION = ".,;:!?'\"\u00ab\u00bb\u201e\u201c\u201d\u2019\u2026"
+# A closing bracket goes back to the text only when the text is what opened it.
+# "(https://example.com/a)" is a URL in parentheses; the Wikipedia path
+# ".../Foo_(bar)" ends in one of its own accord and must keep it.
+BRACKET_PAIRS = {")": "(", "]": "[", "}": "{", ">": "<"}
+ONE_LINE = "a line of text"
+MANY_LINES = "{count} lines of text"
+
+
+def _scheme_start(token):
+    """Where a scheme begins inside a token, past a bracket or quote glued in front."""
+    starts = [start for start in (token.lower().find(scheme) for scheme in URL_SCHEMES) if start >= 0]
+    return min(starts) if starts else None
+
+
+def _without_trailing_punctuation(url):
+    """Give back to the sentence what belongs to it: a full stop, a closing quote."""
+    while url:
+        last = url[-1]
+        if last in TRAILING_PUNCTUATION:
+            url = url[:-1]
+        elif last in BRACKET_PAIRS and url.count(BRACKET_PAIRS[last]) < url.count(last):
+            url = url[:-1]
+        else:
+            break
+    return url
+
+
+def first_url(text):
+    """The first http(s) URL in text with the sentence trimmed off it, or None.
+
+    Scanning by token rather than by pattern is what lets punctuation glued to
+    either end come off: "<https://example.com/a>," is one token, and the scheme
+    says where the URL starts inside it.
+    """
+    for token in text.split():
+        start = _scheme_start(token)
+        if start is None:
+            continue
+        candidate = _without_trailing_punctuation(token[start:])
+        # A bare "https://" is a mention of the scheme, not a link; keep looking.
+        if candidate.lower() not in URL_SCHEMES:
+            return candidate
+    return None
+
+
+def describe_input(text):
+    """How the trace names what arrived: a URL as itself, prose by its size.
+
+    A pasted paragraph echoed in full would spread the one-line-per-fact trace
+    over as many lines as the clipboard happened to hold. A URL keeps being
+    printed as itself, so a link handed over alone traces exactly as before.
+    """
+    if len(text.split()) == 1:
+        return text.strip()
+    lines = len(text.strip().splitlines())
+    return ONE_LINE if lines == 1 else MANY_LINES.format(count=lines)
+
+
 # --- reading a page that forwards on -----------------------------------------
 #
 # A shortener answering 200 text/html has not necessarily arrived; the page may
@@ -320,6 +389,17 @@ UNREAD_MESSAGE = "  .. off the host asked, page not read"
 # Also a decision rather than a finding, and the one place this tool alters the
 # URL it was handed rather than reading it, so it says so before going on.
 SCHEME_MESSAGE = "  .. no scheme given, assuming " + DEFAULT_SCHEME
+# The other such decision: which of the words that arrived is the link. It is
+# announced for the same reason, and the URL taken is printed under it.
+TEXT_MESSAGE = "  .. text around the link, taking the first"
+# Both ways the input can hold no link at all. They are separate because they
+# call for different moves: one wants a link pasted, the other wants the scheme
+# typed in front of the one that is already there.
+NO_LINK_MESSAGE = (
+    "no http:// or https:// link in the text. A link inside running text has to "
+    "carry its scheme, or there is no telling it from an ordinary word."
+)
+EMPTY_INPUT_MESSAGE = "nothing to unwrap: {source} is empty."
 # The two kinds of answer this tool can end on: one read out of a wrapper or
 # confirmed by a server, one read off a page's shape. They print differently so
 # that a glance at the trace says which one reached stdout and the clipboard.
@@ -981,7 +1061,11 @@ def _parser():
         epilog=FOLLOW_EPILOG.format(launch_port=TOR_LAUNCH_PORT),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("url", nargs="?", help="URL to unwrap (default: read the clipboard)")
+    parser.add_argument(
+        "url",
+        nargs="?",
+        help="URL to unwrap, or text with a link in it (default: read stdin when it is piped, else the clipboard)",
+    )
     following = parser.add_argument_group("tor and following")
     following.add_argument(
         "-f",
@@ -1019,13 +1103,30 @@ def main(argv=None):
 
     if args.url:
         url, source = args.url, "command line"
+    elif sys.stdin is not None and not sys.stdin.isatty():
+        # Piped in, so it was meant for us; a terminal on stdin means nobody
+        # typed anything and the clipboard is the gesture.
+        url, source = sys.stdin.read(), "stdin"
     else:
         url, source = _clipboard().paste(), "clipboard"
 
+    words = url.split()
+    if not words:
+        raise SystemExit(EMPTY_INPUT_MESSAGE.format(source=source))
+
     # One vocabulary for both stages: a URL that was read or asked, and "->" the
     # raw thing it yielded, tracking included. Extracting a target from a wrapper
-    # and following a redirect are the same move, so they read the same way.
-    report(f"from {source}: {url}")
+    # and following a redirect are the same move, so they read the same way -
+    # and so does pulling the link out of the words it was pasted with.
+    report(f"from {source}: {describe_input(url)}")
+    if len(words) > 1:
+        found = first_url(url)
+        if found is None:
+            raise SystemExit(NO_LINK_MESSAGE)
+        report(TEXT_MESSAGE)
+        report(f"  -> {found}")
+        url = found
+
     schemed = with_scheme(url)
     if schemed != url:
         report(SCHEME_MESSAGE)

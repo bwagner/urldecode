@@ -37,7 +37,8 @@ usage: urldecode.py [-h] [-f] [-T] [-a N] [-n] [-q] [url]
 Find where a link really goes, and strip the tracking on the way.
 
 positional arguments:
-  url                   URL to unwrap (default: read the clipboard)
+  url                   URL to unwrap, or text with a link in it (default:
+                        read stdin when it is piped, else the clipboard)
 
 options:
   -h, --help            show this help message and exit
@@ -65,7 +66,35 @@ tor and following:
 
 With no argument it reads the clipboard, so the usual gesture is to copy a link
 and run `urldecode.py` with no arguments: the unwrapped URL is printed and
-copied back, ready to paste.
+copied back, ready to paste. Piped input is read instead when there is any, so
+`pbpaste | urldecode.py` and `urldecode.py < mail.txt` work as well.
+
+The input does not have to be a bare URL. A link is usually copied with the
+text around it - a headline above it, an arrow in front of it - and the first
+link in that text is the one taken:
+
+```console
+$ urldecode.py -n < article.txt
+from stdin: 3 lines of text
+  .. text around the link, taking the first
+  -> https://mrf.lu/2Lhvb
+unwrapped:
+https://mrf.lu/2Lhvb
+```
+
+Only a link carrying its scheme is looked for. Inside running text there is no
+telling `mrf.lu/2Lhvb` from `etc.` or `z.B.` without a public-suffix list, and
+guessing would send a host that does not exist over tor - so text with no
+`http://` or `https://` in it is refused rather than half-read:
+
+```console
+$ echo 'Zum Artikel -> mrf.lu/2Lhvb' | urldecode.py
+from stdin: a line of text
+no http:// or https:// link in the text. A link inside running text has to carry its scheme, or there is no telling it from an ordinary word.
+```
+
+That applies to text only. A URL handed over on its own is still taken as it
+is, scheme or no scheme, so `urldecode.py tinyurl.com/x` keeps working.
 
 By default it traces what it did:
 
@@ -84,6 +113,13 @@ to stderr and the resulting URL to stdout**, so piping gives you the URL alone
 whether or not you pass `-q`; `-q` silences the trace itself.
 
 ## What it does
+
+**Finds the link in the text it was given.** Input holding more than one word
+is read as text with a link in it, and the first `http(s)` URL is taken out of
+it, less whatever punctuation the sentence had wrapped around it - a full stop,
+a closing quote, a bracket the text opened. A bracket the URL opened itself is
+kept, so `.../Bar_(unit)` survives. Text with no such link in it is refused,
+and so is empty input.
 
 **Unwraps redirectors.** Any URL carrying its target in a query parameter is
 unwrapped, so `l.facebook.com/l.php?u=...` and `google.com/url?q=...` both work
@@ -112,7 +148,8 @@ Surviving parameters keep their raw text rather than being decoded and
 re-encoded, and decoding uses `unquote` rather than `unquote_plus` so a literal
 `+` stays a `+`.
 
-Fragments are kept, with one exception. A fragment never reaches the server, so
+[Fragments](https://developer.mozilla.org/en-US/docs/Web/URI/Reference/Fragment)
+are kept, with one exception. A fragment never reaches the server, so
 a marker in one is read by the page's own JavaScript on arrival - `#Echobox=...`
 does the same job as an `fbclid` by another route. A fragment that reads as
 `key=value` is therefore matched against the same rule as a query parameter and
@@ -134,7 +171,7 @@ observable. That only works because a wrapper like `l.php?u=...` *carries* its
 destination. A shortener such as `mrf.lu/2sW97` does not - the path is a
 database key, and the only way to learn where it points is to ask the server.
 
-`--follow` asks, through tor, and keeps unwrapping until the URL settles:
+`--follow` asks, through [tor](https://www.torproject.org/), and keeps unwrapping until the URL settles:
 
 ```console
 $ urldecode.py --follow 'https://l.facebook.com/l.php?u=https%3A%2F%2Fmrf.lu%2F2sW97%3Ffbclid%3DIwZXh0bgNhZW0Example&h=AT0Example'
@@ -462,6 +499,12 @@ forwarding_target(html, "https://short.example/abc")
 `og_title(html)` are available individually, as is
 `no_forward_message(html, base)`, which says why a page that does not forward
 on does not.
+
+`first_url(text)` is pure as well: it returns the first `http(s)` URL in a
+piece of text, punctuation trimmed, or `None` when there is none. `unwrap` and
+the rest are left alone by it - pulling a link out of prose and filling in a
+missing scheme both happen where the input is read, so a library caller gets
+back exactly what it passed.
 
 `pyperclip` is imported lazily, so importing the module does not require it.
 

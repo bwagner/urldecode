@@ -1,5 +1,6 @@
 """Tests for urldecode: unwrapping redirector links and stripping tracking params."""
 
+import io
 import re
 import socket
 import sys
@@ -16,6 +17,7 @@ from urldecode import (
     BLOCKING_STATUSES,
     DEFAULT_SCHEME,
     DESTINATION_MESSAGE,
+    EMPTY_INPUT_MESSAGE,
     INFERRED_LABEL,
     MAX_BLOCKED_ATTEMPTS,
     SOCKS_SCHEME,
@@ -24,6 +26,8 @@ from urldecode import (
     REQUEST_FAILED_MESSAGE,
     SCHEME_MESSAGE,
     NO_LINKS_MESSAGE,
+    NO_LINK_MESSAGE,
+    TEXT_MESSAGE,
     UNCORROBORATED_MESSAGE,
     UNREACHED_LABEL,
     UNREAD_MESSAGE,
@@ -38,7 +42,10 @@ from urldecode import (
     bounded_text,
     chosen_result,
     confirm_tor,
+    describe_input,
+    first_url,
     follow,
+    main,
     forwarding_target,
     is_blocked,
     needs_get,
@@ -1218,6 +1225,130 @@ def test_the_readme_usage_block_is_the_parsers_help(monkeypatch):
     monkeypatch.setenv(COLUMNS_ENV, str(HELP_COLUMNS))
     monkeypatch.setattr(sys, "argv", [HELP_PROG])
     assert readme_usage_block() == _parser().format_help()
+
+
+# --- finding the link in the text around it ----------------------------------
+#
+# A link is rarely copied alone. What arrives is the headline, an arrow and the
+# link, and every character of that used to be handed to httpx as one URL.
+
+
+# The paste that prompted this, arrow and blank line included.
+ARTICLE_TEXT = (
+    "China-Autos \u00fcberall: Warum BYD etc. gerade die Welt erobern\n"
+    "\n"
+    "Zum Artikel \u27a1\ufe0f https://mrf.lu/2Lhvb"
+)
+ARTICLE_LINK = "https://mrf.lu/2Lhvb"
+
+
+def test_the_link_is_found_in_the_text_around_it():
+    assert first_url(ARTICLE_TEXT) == ARTICLE_LINK
+
+
+def test_an_emoji_glued_to_the_link_is_not_part_of_it():
+    assert first_url("Zum Artikel \u27a1\ufe0fhttps://mrf.lu/2Lhvb") == ARTICLE_LINK
+
+
+def test_the_sentences_full_stop_is_not_part_of_the_link():
+    assert first_url("Es steht hier: https://mrf.lu/2Lhvb.") == ARTICLE_LINK
+
+
+def test_a_link_loses_only_the_bracket_the_text_opened():
+    assert first_url("(https://mrf.lu/2Lhvb)") == ARTICLE_LINK
+    assert first_url("<https://mrf.lu/2Lhvb>,") == ARTICLE_LINK
+
+
+def test_a_bracket_the_url_opened_itself_survives():
+    # The failure the balance check exists for: a Wikipedia path ends in ")"
+    # of its own accord, and trimming it gives a URL that resolves nowhere.
+    wikipedia = "https://en.wikipedia.org/wiki/Bar_(unit)"
+    assert first_url(f"see {wikipedia} for more") == wikipedia
+
+
+def test_a_trailing_slash_belongs_to_the_path():
+    assert first_url("Zum Artikel: https://example.com/a/") == "https://example.com/a/"
+
+
+def test_the_first_of_several_links_is_the_one_taken():
+    assert first_url("https://a.example/1 and https://b.example/2") == "https://a.example/1"
+
+
+def test_a_link_without_a_scheme_is_not_found_in_text():
+    # The rule the whole section rests on: inside prose there is no telling
+    # "mrf.lu/2Lhvb" from "etc." or "z.B." without a public-suffix list, and a
+    # guess would hand tor a host that does not exist.
+    assert first_url("Zum Artikel \u27a1\ufe0f mrf.lu/2Lhvb") is None
+
+
+def test_text_with_no_link_at_all_yields_nothing():
+    assert first_url("China-Autos \u00fcberall: Warum BYD etc.") is None
+
+
+def test_a_scheme_named_in_prose_is_not_a_link():
+    # "https://" on its own is a mention of the scheme, and the real link may
+    # still be further along the sentence.
+    assert first_url("prefix it with https:// like https://mrf.lu/2Lhvb") == ARTICLE_LINK
+    assert first_url("prefix it with https://") is None
+
+
+def test_a_url_handed_over_alone_is_returned_unchanged():
+    assert first_url(ARTICLE_LINK) == ARTICLE_LINK
+
+
+def test_a_url_alone_is_traced_as_itself():
+    # What keeps every console block in the README true: a link pasted on its
+    # own still prints on the "from" line exactly as it arrived.
+    assert describe_input(ARTICLE_LINK) == ARTICLE_LINK
+    assert describe_input(f"  {ARTICLE_LINK}\n") == ARTICLE_LINK
+
+
+def test_text_is_traced_by_its_size_instead():
+    # A pasted paragraph echoed in full would spread one fact over as many
+    # lines as the clipboard happened to hold.
+    assert describe_input(ARTICLE_TEXT) == "3 lines of text"
+    assert describe_input("Zum Artikel: https://mrf.lu/2Lhvb") == "a line of text"
+
+
+def test_taking_the_first_link_is_announced():
+    # Like the scheme fill-in below, this is the tool deciding something about
+    # the input rather than reading it, so it must not happen silently.
+    assert TEXT_MESSAGE.startswith("  ..")
+
+
+# --- what happens when there is no link to find ------------------------------
+
+
+def test_text_without_a_link_complains(capsys):
+    with pytest.raises(SystemExit) as complaint:
+        main(["-n", "Zum Artikel \u27a1\ufe0f mrf.lu/2Lhvb"])
+    assert str(complaint.value) == NO_LINK_MESSAGE
+
+
+def test_empty_input_complains_of_emptiness_instead(monkeypatch, capsys):
+    # A different complaint on purpose: nothing was pasted at all, so asking
+    # for a scheme would be answering a question nobody asked.
+    monkeypatch.setattr(sys, "stdin", io.StringIO("   \n"))
+    with pytest.raises(SystemExit) as complaint:
+        main(["-n"])
+    assert str(complaint.value) == EMPTY_INPUT_MESSAGE.format(source="stdin")
+
+
+def test_the_link_in_the_text_is_what_reaches_stdout(capsys):
+    main(["-n", "-q", f"Zum Artikel \u27a1\ufe0f {ARTICLE_LINK}?mrfcid=123"])
+    assert capsys.readouterr().out == ARTICLE_LINK + "\n"
+
+
+def test_a_paragraph_piped_in_is_read_from_stdin(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "stdin", io.StringIO(ARTICLE_TEXT))
+    main(["-n", "-q"])
+    assert capsys.readouterr().out == ARTICLE_LINK + "\n"
+
+
+def test_an_argument_outranks_what_is_piped_in(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "stdin", io.StringIO(ARTICLE_TEXT))
+    main(["-n", "-q", "https://other.example/x"])
+    assert capsys.readouterr().out == "https://other.example/x\n"
 
 
 # --- a URL that arrived without a scheme -------------------------------------
